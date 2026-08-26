@@ -1,0 +1,61 @@
+# llm-proxy configuration.
+# Copy to config.toml and fill in your keys, then run: llm-proxy --config config.toml
+
+# Provider used when the requested model matches nothing below.
+# Must stay above [server]: in TOML a bare key after a table header belongs to it.
+default_provider = "deepseek"
+
+[server]
+host = "0.0.0.0"          # use "127.0.0.1" to accept local clients only
+port = 8600
+request_timeout_secs = 600 # whole upstream request, including a long stream
+connect_timeout_secs = 15
+max_body_mb = 64
+# Keys clients must send as `Authorization: Bearer <key>`.
+# Leave empty (or omit) to accept any client — fine for 127.0.0.1 only.
+api_keys = []
+
+[providers.deepseek]
+base_url = "https://api.deepseek.com/v1"
+# Either a literal key, or "${ENV_VAR}" / "env:ENV_VAR" to read the environment.
+api_key = "${DEEPSEEK_API_KEY}"
+# Models this provider serves. If omitted, the list is fetched from the provider
+# on GET /v1/models. Listed models also route here without a "deepseek:" prefix.
+models = ["deepseek-chat", "deepseek-reasoner"]
+
+# Let clients that hardcode OpenAI model names work unchanged: the left-hand
+# name is what the client sends, the right-hand name is sent upstream.
+[providers.deepseek.model_aliases]
+"gpt-4o" = "deepseek-chat"
+"gpt-4o-mini" = "deepseek-chat"
+"o1" = "deepseek-reasoner"
+
+# Any other OpenAI-compatible endpoint can be added the same way. Address it
+# from a client as "<provider>:<model>", e.g. "openrouter:qwen/qwen3-max".
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key = "${OPENROUTER_API_KEY}"
+
+[providers.openrouter.headers]
+"HTTP-Referer" = "http://localhost:8600"
+"X-Title" = "llm-proxy"
+
+# A local llama.cpp server (llama-server) needs no key at all. Start it with e.g.
+#   llama-server -m model.gguf --port 8503
+# and address it from a client as "llamacpp:<model>", or as "local" via the alias below.
+[providers.llamacpp]
+base_url = "http://127.0.0.1:8503/v1"
+# llama-server only requires a key if it was started with --api-key; if so, set it here.
+# api_key = "${LLAMA_CPP_API_KEY}"
+# Leave `models` unset: GET /v1/models then reports whichever model llama-server has loaded.
+fetch_models = true
+
+# llama-server serves one model and ignores the requested name, so a stable alias saves
+# clients from tracking which .gguf is loaded. Aliases are exposed unprefixed, so a client
+# can simply ask for "local".
+[providers.llamacpp.model_aliases]
+"local" = "local-model"
+
+# Ollama works the same way:
+# [providers.ollama]
+# base_url = "http://127.0.0.1:11434/v1"
