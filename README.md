@@ -10,7 +10,7 @@ nothing is buffered.
 
 ```sh
 cp config.example.toml config.toml     # then edit it
-export DEEPSEEK_API_KEY=sk-...         # if you kept the "${DEEPSEEK_API_KEY}" placeholder
+cp .env.example .env                   # then paste your API keys in
 cargo run --release
 ```
 
@@ -65,6 +65,23 @@ api_key = "${DEEPSEEK_API_KEY}"
 `default_provider` must appear **above** the first `[table]` header — in TOML a bare key
 after a table header belongs to that table.
 
+### API keys and `.env`
+
+Keys are kept out of `config.toml` by writing `"${DEEPSEEK_API_KEY}"` and putting the value
+in a `.env` file:
+
+```
+DEEPSEEK_API_KEY=sk-...
+OPENROUTER_API_KEY=sk-...
+```
+
+The proxy loads `.env` from beside the config file, falling back to the nearest `.env` from
+the working directory; `--env-file <path>` overrides both. A real environment variable of
+the same name wins over the file, so a shell `export` still takes effect. Startup fails with
+a pointed error if a referenced variable is missing or blank, rather than sending an empty
+key upstream and failing later with a 401. Both `.env` and `config.toml` are gitignored;
+`.env.example` and `config.example.toml` are the tracked templates.
+
 ### `[server]`
 
 | Key | Default | Meaning |
@@ -102,7 +119,7 @@ than being read as a prefix.
 ## CLI
 
 ```
-llm-proxy [--config <path>] [--port <port>] [--host <addr>] [--check]
+llm-proxy [--config <path>] [--env-file <path>] [--port <port>] [--host <addr>] [--check]
 ```
 
 `--config` defaults to `config.toml` and also reads `LLM_PROXY_CONFIG`. `--check` validates

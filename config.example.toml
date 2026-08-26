@@ -17,7 +17,8 @@ api_keys = []
 
 [providers.deepseek]
 base_url = "https://api.deepseek.com/v1"
-# Either a literal key, or "${ENV_VAR}" / "env:ENV_VAR" to read the environment.
+# Either a literal key, or "${ENV_VAR}" / "env:ENV_VAR" to read it from the environment
+# or from the .env file beside this config (see .env.example).
 api_key = "${DEEPSEEK_API_KEY}"
 # Models this provider serves. If omitted, the list is fetched from the provider
 # on GET /v1/models. Listed models also route here without a "deepseek:" prefix.

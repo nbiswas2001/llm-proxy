@@ -14,7 +14,8 @@ cargo fmt
 ```
 
 `LLM_PROXY_LOG=llm_proxy=debug` logs every forwarded request (provider, URL, model, stream flag).
-`--port` / `--host` override the config file.
+`--port` / `--host` override the config file. Secrets live in a gitignored `.env`
+(`.env.example` is the template); `--env-file` points at a different one.
 
 Rust edition 2024; the code uses let-chains, so it needs a recent stable toolchain.
 
@@ -62,9 +63,13 @@ version segment (base `.../v1` + path `/v1/chat/completions` must not yield `/v1
 All config structs use `#[serde(deny_unknown_fields)]`, so a typo'd key is a startup error
 rather than a silently ignored setting — adding a config option means adding the field.
 `expand_env` handles `"${VAR}"` / `"env:VAR"` only as a *whole* string, not interpolated
-within one.
+within one. It resolves against the process environment, which `load_env_file` has already
+populated from `.env` (real environment variables win — `dotenvy` does not override). A key
+that resolves to empty is a startup error, since an unfilled `.env` line would otherwise
+send `Bearer ` upstream and fail as a confusing 401.
 
-**`src/main.rs`** wires the CLI, builds the shared `reqwest::Client` (its `timeout` covers a
+**`src/main.rs`** loads `.env` *before* initializing logging — so `LLM_PROXY_LOG` can be set
+there too — then wires the CLI, builds the shared `reqwest::Client` (its `timeout` covers a
 whole streamed response, hence the 600s default), and constructs `AppState { config, http }`.
 
 ## Config file gotcha

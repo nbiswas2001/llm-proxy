@@ -120,9 +120,17 @@ impl Config {
             if !provider.base_url.starts_with("http") {
                 bail!("provider \"{name}\": base_url must start with http:// or https://");
             }
-            if let Some(key) = &provider.api_key {
-                provider.api_key =
-                    Some(expand_env(key).with_context(|| format!("provider \"{name}\": api_key"))?);
+            if let Some(raw) = provider.api_key.clone() {
+                let key =
+                    expand_env(&raw).with_context(|| format!("provider \"{name}\": api_key"))?;
+                if key.trim().is_empty() {
+                    bail!(
+                        "provider \"{name}\": api_key = \"{raw}\" resolved to an empty value; \
+                         fill it in (e.g. in the .env file) or drop the api_key line if this \
+                         provider needs no key"
+                    );
+                }
+                provider.api_key = Some(key);
             }
             if provider.api_key.is_none()
                 && let Some(var) = &provider.api_key_env
@@ -130,6 +138,12 @@ impl Config {
                 let value = std::env::var(var).with_context(|| {
                     format!("provider \"{name}\": api_key_env = \"{var}\" is not set")
                 })?;
+                if value.trim().is_empty() {
+                    bail!(
+                        "provider \"{name}\": api_key_env = \"{var}\" is set but empty; \
+                         fill it in (e.g. in the .env file)"
+                    );
+                }
                 provider.api_key = Some(value);
             }
             for (header, value) in &mut provider.headers {

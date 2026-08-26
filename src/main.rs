@@ -1,13 +1,18 @@
 mod config;
 mod proxy;
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
 use clap::Parser;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
@@ -25,6 +30,10 @@ struct Cli {
     /// Override the bind address from the config file.
     #[arg(long)]
     host: Option<String>,
+    /// Path to a .env file holding API keys. Defaults to `.env` beside the config
+    /// file, then the nearest `.env` from the working directory.
+    #[arg(long)]
+    env_file: Option<PathBuf>,
     /// Validate the config and exit without binding a port.
     #[arg(long)]
     check: bool,
@@ -38,6 +47,10 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // Before logging is set up, so LLM_PROXY_LOG can also come from the .env file.
+    let env_file = load_env_file(cli.env_file.as_deref(), &cli.config)?;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_env("LLM_PROXY_LOG")
@@ -45,7 +58,11 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cli = Cli::parse();
+    match &env_file {
+        Some(path) => info!("loaded secrets from {}", path.display()),
+        None => debug!("no .env file found; using the environment as-is"),
+    }
+
     if !cli.config.exists() {
         anyhow::bail!(
             "config file {} not found - copy config.example.toml to it and add your API key",
@@ -127,6 +144,23 @@ async fn main() -> Result<()> {
         .await
         .context("running the server")?;
     Ok(())
+}
+
+/// Load API keys from a .env file so config placeholders like "${DEEPSEEK_API_KEY}"
+/// resolve. Real environment variables take precedence over file entries.
+fn load_env_file(explicit: Option<&Path>, config_path: &Path) -> Result<Option<PathBuf>> {
+    if let Some(path) = explicit {
+        dotenvy::from_path(path).with_context(|| format!("reading env file {}", path.display()))?;
+        return Ok(Some(path.to_path_buf()));
+    }
+    // Keys usually sit next to the config file they are referenced from.
+    let beside_config = config_path.parent().unwrap_or(Path::new(".")).join(".env");
+    if beside_config.is_file() {
+        dotenvy::from_path(&beside_config)
+            .with_context(|| format!("reading env file {}", beside_config.display()))?;
+        return Ok(Some(beside_config));
+    }
+    Ok(dotenvy::dotenv().ok())
 }
 
 async fn shutdown_signal() {
