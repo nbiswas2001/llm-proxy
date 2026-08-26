@@ -119,12 +119,31 @@ than being read as a prefix.
 ## CLI
 
 ```
-llm-proxy [--config <path>] [--env-file <path>] [--port <port>] [--host <addr>] [--check]
+llm-proxy [-v|-vv] [--config <path>] [--env-file <path>] [--port <port>] [--host <addr>] [--check]
 ```
 
 `--config` defaults to `config.toml` and also reads `LLM_PROXY_CONFIG`. `--check` validates
-the config and exits. Log level comes from `LLM_PROXY_LOG` (e.g.
-`LLM_PROXY_LOG=llm_proxy=debug` to log every forwarded request).
+the config and exits.
+
+### Watching traffic (`-v`)
+
+Without a flag the proxy only logs startup, then stays quiet. `-v` prints a line per
+request - where it was routed, the status, and how long it took:
+
+```
+DEBUG -> POST /v1/chat/completions  provider=deepseek  model=deepseek-chat  stream
+DEBUG    upstream https://api.deepseek.com/v1/chat/completions
+DEBUG <- 200 OK for POST /v1/chat/completions  headers in 412ms
+DEBUG    done POST /v1/chat/completions  8241 B in 96 chunk(s), 6019ms
+```
+
+For a stream, the `headers in` and `done` timings are separate on purpose: the first is how
+long the provider took to start answering, the second how long the whole stream ran. A
+client that hangs up early logs `aborted` instead, with what it received before leaving.
+
+`-vv` additionally logs request bodies and every response chunk. That includes prompts and
+completions, so use it for debugging rather than as a default. `LLM_PROXY_LOG` still
+overrides both (e.g. `LLM_PROXY_LOG=llm_proxy=trace,reqwest=debug`).
 
 ## Notes
 

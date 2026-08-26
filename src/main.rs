@@ -34,6 +34,10 @@ struct Cli {
     /// file, then the nearest `.env` from the working directory.
     #[arg(long)]
     env_file: Option<PathBuf>,
+    /// Log each request on screen: provider, model, status, timing. Repeat
+    /// (-vv) to also log request bodies and individual response chunks.
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    verbose: u8,
     /// Validate the config and exit without binding a port.
     #[arg(long)]
     check: bool,
@@ -52,9 +56,11 @@ async fn main() -> Result<()> {
     let env_file = load_env_file(cli.env_file.as_deref(), &cli.config)?;
 
     tracing_subscriber::fmt()
+        .with_target(false)
+        // An explicit LLM_PROXY_LOG wins; otherwise -v picks the level.
         .with_env_filter(
             EnvFilter::try_from_env("LLM_PROXY_LOG")
-                .unwrap_or_else(|_| EnvFilter::new("llm_proxy=info,tower_http=warn")),
+                .unwrap_or_else(|_| EnvFilter::new(log_filter(cli.verbose))),
         )
         .init();
 
@@ -144,6 +150,16 @@ async fn main() -> Result<()> {
         .await
         .context("running the server")?;
     Ok(())
+}
+
+/// Verbosity from `-v` flags: quiet startup-only by default, per-request lines
+/// at `-v`, request bodies and response chunks at `-vv`.
+fn log_filter(verbose: u8) -> &'static str {
+    match verbose {
+        0 => "llm_proxy=info,tower_http=warn",
+        1 => "llm_proxy=debug,tower_http=info",
+        _ => "llm_proxy=trace,tower_http=debug",
+    }
 }
 
 /// Load API keys from a .env file so config placeholders like "${DEEPSEEK_API_KEY}"

@@ -2,3 +2,6 @@
 config.toml
 .env
 *.log
+
+# Stray copies of the built binary at the repo root
+/*.exe

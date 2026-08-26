@@ -1,13 +1,19 @@
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Instant,
+};
 
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
 };
+use futures_util::Stream;
 use serde_json::{Value, json};
-use tracing::{debug, warn};
+use tracing::{Level, debug, enabled, trace, warn};
 
 use crate::AppState;
 use crate::config::{Config, Provider};
@@ -40,6 +46,7 @@ pub async fn health() -> impl IntoResponse {
 /// Catch-all handler: forwards any OpenAI-style request to the routed provider
 /// and streams the upstream response straight back to the client.
 pub async fn proxy(State(state): State<AppState>, request: Request) -> Response {
+    let started = Instant::now();
     let (parts, body) = request.into_parts();
 
     if let Some(response) = client_auth_error(&state.config, &parts.headers) {
@@ -105,14 +112,17 @@ pub async fn proxy(State(state): State<AppState>, request: Request) -> Response 
         .provider
         .upstream_url(parts.uri.path(), parts.uri.query());
     let streaming = is_stream_request(&outgoing_bytes);
+    let label = format!("{} {}", parts.method, parts.uri.path());
     debug!(
-        provider = route.name,
-        method = %parts.method,
-        %url,
-        model = requested_model.as_deref().unwrap_or("-"),
-        stream = streaming,
-        "forwarding request"
+        "-> {label}  provider={}  model={}{}",
+        route.name,
+        requested_model.as_deref().unwrap_or("-"),
+        if streaming { "  stream" } else { "" }
     );
+    debug!("   upstream {url}");
+    if enabled!(Level::TRACE) && !outgoing_bytes.is_empty() {
+        trace!("   request body: {}", preview(&outgoing_bytes));
+    }
 
     let mut upstream = state.http.request(parts.method.clone(), &url);
     for (name, value) in parts.headers.iter() {
@@ -159,7 +169,102 @@ pub async fn proxy(State(state): State<AppState>, request: Request) -> Response 
         );
     }
 
-    (status, headers, Body::from_stream(response.bytes_stream())).into_response()
+    debug!(
+        "<- {status} for {label}  headers in {}",
+        millis(started.elapsed())
+    );
+
+    let body = LoggedStream {
+        inner: Box::pin(response.bytes_stream()),
+        label,
+        started,
+        bytes: 0,
+        chunks: 0,
+        ended: false,
+    };
+    (status, headers, Body::from_stream(body)).into_response()
+}
+
+/// Wraps the upstream body so the size and duration of a response - a long
+/// stream especially - show up on screen once it finishes.
+struct LoggedStream {
+    inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
+    label: String,
+    started: Instant,
+    bytes: u64,
+    chunks: u64,
+    ended: bool,
+}
+
+impl Stream for LoggedStream {
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                this.bytes += chunk.len() as u64;
+                this.chunks += 1;
+                if enabled!(Level::TRACE) {
+                    trace!(
+                        "   chunk {} ({} B): {}",
+                        this.chunks,
+                        chunk.len(),
+                        preview(&chunk)
+                    );
+                }
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(err))) => {
+                this.ended = true;
+                warn!("   {} failed mid-body: {err}", this.label);
+                Poll::Ready(Some(Err(err)))
+            }
+            Poll::Ready(None) => {
+                this.ended = true;
+                debug!(
+                    "   done {}  {} B in {} chunk(s), {}",
+                    this.label,
+                    this.bytes,
+                    this.chunks,
+                    millis(this.started.elapsed())
+                );
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for LoggedStream {
+    fn drop(&mut self) {
+        if !self.ended {
+            // The client hung up (or timed out) before the body was complete.
+            debug!(
+                "   aborted {}  {} B in {} chunk(s), {}",
+                self.label,
+                self.bytes,
+                self.chunks,
+                millis(self.started.elapsed())
+            );
+        }
+    }
+}
+
+fn millis(elapsed: std::time::Duration) -> String {
+    format!("{:.0}ms", elapsed.as_secs_f64() * 1000.0)
+}
+
+/// A short, single-line excerpt of a body for trace logging.
+fn preview(bytes: &[u8]) -> String {
+    const LIMIT: usize = 500;
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(LIMIT)]);
+    let flattened = text.replace(['\n', '\r'], " ");
+    if bytes.len() > LIMIT {
+        format!("{flattened}... (+{} B)", bytes.len() - LIMIT)
+    } else {
+        flattened
+    }
 }
 
 /// `GET /v1/models`: the union of every provider's models, so a client's model

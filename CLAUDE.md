@@ -13,7 +13,10 @@ cargo clippy --all-targets              # kept at zero warnings
 cargo fmt
 ```
 
-`LLM_PROXY_LOG=llm_proxy=debug` logs every forwarded request (provider, URL, model, stream flag).
+`-v` logs a line per request (route, status, timing); `-vv` adds bodies and per-chunk
+tracing. `log_filter` in `main.rs` maps the count to a filter string, and `LLM_PROXY_LOG`
+overrides it entirely. Per-request logging lives at DEBUG so the default run stays quiet -
+new request-level logging belongs there too, not at INFO.
 `--port` / `--host` override the config file. Secrets live in a gitignored `.env`
 (`.env.example` is the template); `--env-file` points at a different one.
 
@@ -41,9 +44,13 @@ The request lifecycle:
 5. Headers are copied minus `STRIPPED_REQUEST_HEADERS` + `HOP_BY_HOP`; the client's
    `Authorization` is dropped and replaced with the provider's key. `accept-encoding` is
    stripped so upstream never compresses a stream we relay.
-6. The response is re-framed as `Body::from_stream(response.bytes_stream())` — this is what
-   makes streaming incremental rather than buffered. Because the body is re-framed,
-   `content-length` must be dropped from the response headers (`is_stripped_response_header`).
+6. The response is re-framed as `Body::from_stream(...)` — this is what makes streaming
+   incremental rather than buffered. Because the body is re-framed, `content-length` must be
+   dropped from the response headers (`is_stripped_response_header`).
+
+The body is wrapped in `LoggedStream`, which counts bytes and chunks as they pass and logs
+once the stream ends. Its `Drop` impl covers the client-hangup case, which `poll_next` never
+sees — that is the only way an aborted stream gets reported.
 
 Errors are returned in OpenAI's `{"error": {...}}` shape via `error_response`. Upstream
 status codes and error bodies pass through unchanged; only transport failures become
