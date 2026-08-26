@@ -42,12 +42,10 @@ client.chat.completions.create(model="deepseek-chat", messages=[...], stream=Tru
   the client at the same pace the provider emits them.
 - **Keys stay server-side.** The client's `Authorization` header is dropped and replaced
   with the provider key from the config, so clients never hold a real key.
-- **Multiple providers.** Address a non-default provider as `"<provider>:<model>"`, e.g.
-  `"openrouter:qwen/qwen3-max"`.
-- **Model aliases.** Map names a client hardcodes onto real ones — `"gpt-4o"` →
-  `"deepseek-chat"` — and the body is rewritten on the way through.
-- **`GET /v1/models`** returns every provider's models merged into one list (fetched from
-  the provider when not listed in the config), so client model pickers work.
+- **One active provider.** Configure as many as you like; exactly one carries
+  `active = true` and receives every request. Switching provider is moving that flag.
+- **Nothing is rewritten.** The request body is forwarded byte for byte, model name
+  included, so you ask for whatever the active provider serves.
 - **`GET /health`** returns `{"status":"ok"}`.
 
 ## Configuration
@@ -55,15 +53,23 @@ client.chat.completions.create(model="deepseek-chat", messages=[...], stream=Tru
 See `config.example.toml` for the annotated version. Minimum viable config:
 
 ```toml
-default_provider = "deepseek"
-
 [providers.deepseek]
+active = true
 base_url = "https://api.deepseek.com/v1"
 api_key = "${DEEPSEEK_API_KEY}"
 ```
 
-`default_provider` must appear **above** the first `[table]` header — in TOML a bare key
-after a table header belongs to that table.
+**Exactly one provider must set `active = true`.** That one receives every request; the
+rest are ignored entirely, including their API keys — so an inactive provider may reference
+a key you have not set yet. Zero active providers, or two, is a startup error naming them:
+
+```
+Error: providers deepseek, llamacpp are all active; exactly one may set active = true
+Error: no provider is active; set active = true on exactly one of: deepseek, llamacpp
+```
+
+Switching provider means moving the flag and restarting. Model names go to the active
+provider untouched — the proxy neither renames models nor keeps a list of them.
 
 ### API keys and `.env`
 
@@ -78,9 +84,9 @@ OPENROUTER_API_KEY=sk-...
 The proxy loads `.env` from beside the config file, falling back to the nearest `.env` from
 the working directory; `--env-file <path>` overrides both. A real environment variable of
 the same name wins over the file, so a shell `export` still takes effect. Startup fails with
-a pointed error if a referenced variable is missing or blank, rather than sending an empty
-key upstream and failing later with a 401. Both `.env` and `config.toml` are gitignored;
-`.env.example` and `config.example.toml` are the tracked templates.
+a pointed error if the active provider's key is missing or blank, rather than sending an
+empty key upstream and failing later with a 401. Both `.env` and `config.toml` are
+gitignored; `.env.example` and `config.example.toml` are the tracked templates.
 
 ### `[server]`
 
@@ -97,24 +103,11 @@ key upstream and failing later with a 401. Both `.env` and `config.toml` are git
 
 | Key | Meaning |
 | --- | --- |
+| `active` | Exactly one provider must set this to `true`. |
 | `base_url` | Upstream API root, e.g. `https://api.deepseek.com/v1`. |
-| `api_key` | Literal key, or `"${ENV_VAR}"` / `"env:ENV_VAR"` to read the environment. Omit for a provider that needs none. |
+| `api_key` | Literal key, or `"${ENV_VAR}"` / `"env:ENV_VAR"` to read the environment or `.env`. Omit for a provider that needs none. |
 | `api_key_env` | Alternative spelling: the name of the environment variable. |
-| `models` | Models this provider serves. Listed models route here **without** a `<provider>:` prefix. If omitted, the list is fetched from the provider for `/v1/models`. |
-| `model_aliases` | `{ "client-name" = "upstream-name" }`; the request body is rewritten. |
 | `headers` | Extra headers sent upstream (values support `"${ENV_VAR}"`). |
-| `fetch_models` | Ask the provider for its model list when `models` is empty (default `true`). |
-
-### How a model name is routed
-
-1. `"<provider>:<model>"` — explicit, wins over everything.
-2. A key in some provider's `model_aliases`.
-3. A name listed in some provider's `models`.
-4. `default_provider` (or the sole provider, if only one is configured).
-
-The default provider is checked first at steps 2 and 3, so it wins ambiguous names. A colon
-in a name that is not a configured provider (`"llama3:8b"`) falls through to step 2 rather
-than being read as a prefix.
 
 ## CLI
 

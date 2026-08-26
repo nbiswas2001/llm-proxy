@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, path::Path};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -8,9 +8,10 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
-    /// Provider used when the requested model matches no provider explicitly.
-    pub default_provider: Option<String>,
     pub providers: BTreeMap<String, Provider>,
+    /// Name of the one provider with `active = true`, resolved at load time.
+    #[serde(skip)]
+    active_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -35,24 +36,18 @@ pub struct ServerConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
+    /// Exactly one provider in the file must set this.
+    #[serde(default)]
+    pub active: bool,
     /// e.g. "https://api.deepseek.com/v1"
     pub base_url: String,
-    /// Literal key, or "${ENV_VAR}" to read it from the environment.
+    /// Literal key, or "${ENV_VAR}" to read it from the environment or .env file.
     pub api_key: Option<String>,
     /// Alternative to `api_key`: name of an environment variable holding the key.
     pub api_key_env: Option<String>,
-    /// Models this provider serves. Used for routing and for `GET /v1/models`.
-    #[serde(default)]
-    pub models: Vec<String>,
-    /// Client-facing name -> upstream name, e.g. "gpt-4o" = "deepseek-chat".
-    #[serde(default)]
-    pub model_aliases: BTreeMap<String, String>,
     /// Extra headers sent upstream (values support "${ENV_VAR}").
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
-    /// Ask the upstream API for its model list when `models` is empty.
-    #[serde(default = "default_true")]
-    pub fetch_models: bool,
 }
 
 fn default_host() -> String {
@@ -70,9 +65,6 @@ fn default_connect_timeout() -> u64 {
 fn default_body_limit() -> usize {
     64
 }
-fn default_true() -> bool {
-    true
-}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -85,14 +77,6 @@ impl Default for ServerConfig {
             max_body_mb: default_body_limit(),
         }
     }
-}
-
-/// Where a request should go: which provider, and under what upstream model name.
-pub struct Route<'a> {
-    pub name: &'a str,
-    pub provider: &'a Provider,
-    /// `Some` when the model name must be rewritten before forwarding.
-    pub upstream_model: Option<String>,
 }
 
 impl Config {
@@ -109,133 +93,102 @@ impl Config {
         if self.providers.is_empty() {
             bail!("config defines no [providers.<name>] sections");
         }
-        if let Some(default) = &self.default_provider
-            && !self.providers.contains_key(default)
-        {
-            bail!("default_provider = \"{default}\" is not a configured provider");
+
+        let active: Vec<&str> = self
+            .providers
+            .iter()
+            .filter(|(_, provider)| provider.active)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let all = |config: &Self| {
+            config
+                .providers
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        match active.len() {
+            1 => self.active_name = active[0].to_string(),
+            0 => bail!(
+                "no provider is active; set active = true on exactly one of: {}",
+                all(self)
+            ),
+            _ => bail!(
+                "providers {} are all active; exactly one may set active = true",
+                active.join(", ")
+            ),
         }
-        for (name, provider) in &mut self.providers {
-            provider.base_url = expand_env(&provider.base_url)
-                .with_context(|| format!("provider \"{name}\": base_url"))?;
-            if !provider.base_url.starts_with("http") {
-                bail!("provider \"{name}\": base_url must start with http:// or https://");
+
+        // Only the active provider is validated: an inactive one may reference a key
+        // that is not present, which is what makes commenting-in a provider cheap.
+        let name = self.active_name.clone();
+        let provider = self
+            .providers
+            .get_mut(&name)
+            .expect("active provider was just found");
+
+        provider.base_url =
+            expand_env(&provider.base_url).with_context(|| format!("provider \"{name}\""))?;
+        if !provider.base_url.starts_with("http") {
+            bail!("provider \"{name}\": base_url must start with http:// or https://");
+        }
+        if let Some(raw) = provider.api_key.clone() {
+            let key = expand_env(&raw).with_context(|| format!("provider \"{name}\": api_key"))?;
+            if key.trim().is_empty() {
+                bail!(
+                    "provider \"{name}\": api_key = \"{raw}\" resolved to an empty value; \
+                     fill it in (e.g. in the .env file) or drop the api_key line if this \
+                     provider needs no key"
+                );
             }
-            if let Some(raw) = provider.api_key.clone() {
-                let key =
-                    expand_env(&raw).with_context(|| format!("provider \"{name}\": api_key"))?;
-                if key.trim().is_empty() {
-                    bail!(
-                        "provider \"{name}\": api_key = \"{raw}\" resolved to an empty value; \
-                         fill it in (e.g. in the .env file) or drop the api_key line if this \
-                         provider needs no key"
-                    );
-                }
-                provider.api_key = Some(key);
+            provider.api_key = Some(key);
+        }
+        if provider.api_key.is_none()
+            && let Some(var) = &provider.api_key_env
+        {
+            let value = std::env::var(var).with_context(|| {
+                format!("provider \"{name}\": api_key_env = \"{var}\" is not set")
+            })?;
+            if value.trim().is_empty() {
+                bail!(
+                    "provider \"{name}\": api_key_env = \"{var}\" is set but empty; \
+                     fill it in (e.g. in the .env file)"
+                );
             }
-            if provider.api_key.is_none()
-                && let Some(var) = &provider.api_key_env
-            {
-                let value = std::env::var(var).with_context(|| {
-                    format!("provider \"{name}\": api_key_env = \"{var}\" is not set")
-                })?;
-                if value.trim().is_empty() {
-                    bail!(
-                        "provider \"{name}\": api_key_env = \"{var}\" is set but empty; \
-                         fill it in (e.g. in the .env file)"
-                    );
-                }
-                provider.api_key = Some(value);
-            }
-            for (header, value) in &mut provider.headers {
-                *value = expand_env(value)
-                    .with_context(|| format!("provider \"{name}\": header {header}"))?;
-            }
+            provider.api_key = Some(value);
+        }
+        for (header, value) in &mut provider.headers {
+            *value = expand_env(value)
+                .with_context(|| format!("provider \"{name}\": header {header}"))?;
         }
         Ok(())
     }
 
-    /// Pick a provider for a client-supplied model name.
-    ///
-    /// Resolution order: `provider:model` prefix, alias table, declared model list,
-    /// `default_provider`, then the sole provider if only one is configured.
-    pub fn resolve(&self, model: Option<&str>) -> Result<Route<'_>> {
-        if let Some(model) = model {
-            if let Some((prefix, rest)) = model.split_once(':')
-                && !rest.is_empty()
-                && let Some((name, provider)) = self.providers.get_key_value(prefix)
-            {
-                let upstream = provider
-                    .model_aliases
-                    .get(rest)
-                    .cloned()
-                    .unwrap_or_else(|| rest.to_string());
-                return Ok(Route {
-                    name,
-                    provider,
-                    upstream_model: Some(upstream),
-                });
-            }
+    /// The single provider every request is forwarded to.
+    pub fn active(&self) -> (&str, &Provider) {
+        let provider = self
+            .providers
+            .get(&self.active_name)
+            .expect("validated at load time");
+        (self.active_name.as_str(), provider)
+    }
 
-            for (name, provider) in self.ordered_providers() {
-                if let Some(target) = provider.model_aliases.get(model) {
-                    return Ok(Route {
-                        name,
-                        provider,
-                        upstream_model: Some(target.clone()),
-                    });
-                }
-            }
-            for (name, provider) in self.ordered_providers() {
-                if provider.models.iter().any(|m| m == model) {
-                    return Ok(Route {
-                        name,
-                        provider,
-                        upstream_model: None,
-                    });
-                }
-            }
+    /// Catch a model name left over from another provider, e.g. "openrouter:gpt-4o"
+    /// once openrouter has been switched off, instead of passing it upstream to be
+    /// rejected as an unknown model.
+    pub fn reject_stale_prefix(&self, model: &str) -> Result<(), String> {
+        if let Some((prefix, _)) = model.split_once(':')
+            && prefix != self.active_name
+            && self.providers.contains_key(prefix)
+        {
+            return Err(format!(
+                "model \"{model}\" names provider \"{prefix}\", but \"{}\" is the active one; \
+                 drop the \"{prefix}:\" prefix, or make \"{prefix}\" the active provider in the config",
+                self.active_name
+            ));
         }
-
-        self.default_route().ok_or_else(|| match model {
-            Some(model) => anyhow!(
-                "model \"{model}\" matches no provider and no default_provider is configured; use \"<provider>:<model>\" or set default_provider"
-            ),
-            None => anyhow!("no default_provider is configured"),
-        })
-    }
-
-    pub fn default_route(&self) -> Option<Route<'_>> {
-        let (name, provider) = match &self.default_provider {
-            Some(default) => self.providers.get_key_value(default)?,
-            None if self.providers.len() == 1 => self.providers.iter().next()?,
-            None => return None,
-        };
-        Some(Route {
-            name,
-            provider,
-            upstream_model: None,
-        })
-    }
-
-    /// Providers with the default one first, so it wins ambiguous model names.
-    fn ordered_providers(&self) -> impl Iterator<Item = (&str, &Provider)> {
-        let default = self.default_provider.as_deref();
-        let first = default.and_then(|d| self.providers.get_key_value(d));
-        first
-            .into_iter()
-            .chain(
-                self.providers
-                    .iter()
-                    .filter(move |(name, _)| Some(name.as_str()) != default),
-            )
-            .map(|(name, provider)| (name.as_str(), provider))
-    }
-
-    pub fn is_default_provider(&self, name: &str) -> bool {
-        match &self.default_provider {
-            Some(default) => default == name,
-            None => self.providers.len() == 1,
-        }
+        Ok(())
     }
 
     pub fn client_key_accepted(&self, presented: Option<&str>) -> bool {
@@ -288,101 +241,133 @@ fn expand_env(value: &str) -> Result<String> {
 mod tests {
     use super::*;
 
-    fn config(toml_text: &str) -> Config {
+    fn load(toml_text: &str) -> Result<Config> {
         let mut config: Config = toml::from_str(toml_text).expect("parse");
-        config.validate_and_expand().expect("validate");
-        config
+        config.validate_and_expand()?;
+        Ok(config)
     }
 
     const TWO_PROVIDERS: &str = r#"
-default_provider = "deepseek"
-
 [providers.deepseek]
+active = true
 base_url = "https://api.deepseek.com/v1"
 api_key = "test"
-models = ["deepseek-chat"]
-model_aliases = { "gpt-4o" = "deepseek-chat" }
 
-[providers.openrouter]
-base_url = "https://openrouter.ai/api/v1"
-api_key = "test2"
-models = ["qwen/qwen3-max"]
+[providers.llamacpp]
+base_url = "http://127.0.0.1:8503/v1"
 "#;
 
     #[test]
-    fn routes_explicit_provider_prefix() {
-        let config = config(TWO_PROVIDERS);
-        let route = config.resolve(Some("openrouter:some/model")).unwrap();
-        assert_eq!(route.name, "openrouter");
-        assert_eq!(route.upstream_model.as_deref(), Some("some/model"));
+    fn the_active_provider_receives_every_request() {
+        let config = load(TWO_PROVIDERS).unwrap();
+        let (name, provider) = config.active();
+        assert_eq!(name, "deepseek");
+        assert_eq!(provider.api_key(), Some("test"));
     }
 
     #[test]
-    fn routes_alias_and_rewrites_model() {
-        let config = config(TWO_PROVIDERS);
-        let route = config.resolve(Some("gpt-4o")).unwrap();
-        assert_eq!(route.name, "deepseek");
-        assert_eq!(route.upstream_model.as_deref(), Some("deepseek-chat"));
-    }
-
-    #[test]
-    fn routes_declared_model_without_rewrite() {
-        let config = config(TWO_PROVIDERS);
-        let route = config.resolve(Some("qwen/qwen3-max")).unwrap();
-        assert_eq!(route.name, "openrouter");
-        assert!(route.upstream_model.is_none());
-    }
-
-    #[test]
-    fn falls_back_to_default_provider() {
-        let config = config(TWO_PROVIDERS);
-        assert_eq!(
-            config.resolve(Some("unknown-model")).unwrap().name,
-            "deepseek"
+    fn two_active_providers_are_rejected() {
+        let toml_text = TWO_PROVIDERS.replace(
+            "[providers.llamacpp]\nbase_url",
+            "[providers.llamacpp]\nactive = true\nbase_url",
         );
-        assert_eq!(config.resolve(None).unwrap().name, "deepseek");
+        let err = load(&toml_text).unwrap_err().to_string();
+        assert!(err.contains("deepseek, llamacpp"), "{err}");
+        assert!(err.contains("exactly one"), "{err}");
     }
 
     #[test]
-    fn model_with_colon_that_is_not_a_provider_falls_through() {
-        let config = config(TWO_PROVIDERS);
-        // e.g. Ollama-style "llama3:8b" must not be read as provider "llama3".
-        assert_eq!(config.resolve(Some("llama3:8b")).unwrap().name, "deepseek");
+    fn no_active_provider_is_rejected() {
+        let toml_text = TWO_PROVIDERS.replace("active = true\n", "");
+        let err = load(&toml_text).unwrap_err().to_string();
+        assert!(err.contains("no provider is active"), "{err}");
+        assert!(err.contains("deepseek, llamacpp"), "{err}");
+    }
+
+    #[test]
+    fn an_inactive_provider_may_reference_a_missing_key() {
+        // Only the active provider is expanded, so this must not fail to load.
+        let config = load(
+            r#"
+[providers.deepseek]
+active = true
+base_url = "https://api.deepseek.com/v1"
+api_key = "test"
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key = "${DEFINITELY_NOT_SET_12345}"
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.active().0, "deepseek");
+    }
+
+    #[test]
+    fn an_empty_key_is_rejected() {
+        unsafe { std::env::set_var("LLM_PROXY_TEST_BLANK", "  ") };
+        let err = load(
+            r#"
+[providers.deepseek]
+active = true
+base_url = "https://api.deepseek.com/v1"
+api_key = "${LLM_PROXY_TEST_BLANK}"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("empty value"), "{err}");
+    }
+
+    #[test]
+    fn a_prefix_naming_an_inactive_provider_is_an_error() {
+        let config = load(TWO_PROVIDERS).unwrap();
+        let err = config.reject_stale_prefix("llamacpp:qwen").unwrap_err();
+        assert!(err.contains("\"deepseek\" is the active one"), "{err}");
+    }
+
+    #[test]
+    fn ordinary_model_names_pass_through_untouched() {
+        let config = load(TWO_PROVIDERS).unwrap();
+        // Including names that merely contain a colon, e.g. Ollama-style tags.
+        assert!(config.reject_stale_prefix("deepseek-v4-flash").is_ok());
+        assert!(config.reject_stale_prefix("llama3:8b").is_ok());
+        assert!(config.reject_stale_prefix("deepseek:anything").is_ok());
     }
 
     #[test]
     fn upstream_url_does_not_duplicate_version_segment() {
-        let config = config(TWO_PROVIDERS);
-        let deepseek = &config.providers["deepseek"];
+        let config = load(TWO_PROVIDERS).unwrap();
+        let (_, provider) = config.active();
         assert_eq!(
-            deepseek.upstream_url("/v1/chat/completions", None),
+            provider.upstream_url("/v1/chat/completions", None),
             "https://api.deepseek.com/v1/chat/completions"
         );
         assert_eq!(
-            deepseek.upstream_url("/v1/models", Some("limit=5")),
+            provider.upstream_url("/v1/models", Some("limit=5")),
             "https://api.deepseek.com/v1/models?limit=5"
         );
     }
 
     #[test]
     fn upstream_url_appends_when_base_has_no_version() {
-        let mut config: Config = toml::from_str(
+        let config = load(
             r#"
 [providers.local]
+active = true
 base_url = "http://localhost:11434"
 "#,
         )
         .unwrap();
-        config.validate_and_expand().unwrap();
         assert_eq!(
-            config.providers["local"].upstream_url("/v1/chat/completions", None),
+            config.active().1.upstream_url("/v1/chat/completions", None),
             "http://localhost:11434/v1/chat/completions"
         );
     }
 
     #[test]
     fn client_auth_is_open_until_keys_are_configured() {
-        let mut config = config(TWO_PROVIDERS);
+        let mut config = load(TWO_PROVIDERS).unwrap();
         assert!(config.client_key_accepted(None));
         config.server.api_keys = vec!["secret".into()];
         assert!(!config.client_key_accepted(None));

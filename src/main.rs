@@ -84,20 +84,19 @@ async fn main() -> Result<()> {
     }
 
     for (name, provider) in &config.providers {
-        let default = if config.is_default_provider(name) {
-            " (default)"
+        if provider.active {
+            info!(
+                "provider \"{name}\" ACTIVE -> {} [api key: {}]",
+                provider.base_url,
+                if provider.api_key.is_some() {
+                    "yes"
+                } else {
+                    "none"
+                }
+            );
         } else {
-            ""
-        };
-        info!(
-            "provider \"{name}\"{default} -> {} [api key: {}]",
-            provider.base_url,
-            if provider.api_key.is_some() {
-                "yes"
-            } else {
-                "none"
-            }
-        );
+            info!("provider \"{name}\" inactive");
+        }
     }
 
     if cli.check {
@@ -131,8 +130,6 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(proxy::health))
-        .route("/v1/models", get(proxy::list_models))
-        .route("/models", get(proxy::list_models))
         .fallback(proxy::proxy)
         .layer(CorsLayer::permissive())
         .with_state(state);
