@@ -237,7 +237,7 @@ fn preview(bytes: &[u8]) -> String {
     }
 }
 
-fn apply_provider_auth(
+pub fn apply_provider_auth(
     mut request: reqwest::RequestBuilder,
     provider: &Provider,
 ) -> reqwest::RequestBuilder {

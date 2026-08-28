@@ -39,6 +39,14 @@ api_key = "${OPENROUTER_API_KEY}"
 "HTTP-Referer" = "http://localhost:8600"
 "X-Title" = "llm-proxy"
 
+# `llm-proxy --balance` prints the credit left on the active provider and exits.
+# DeepSeek and OpenRouter are built in; a balance API is not part of the OpenAI
+# protocol, so for any other provider that offers one, name its endpoint here.
+# The provider's key and headers are attached, and the JSON that comes back is
+# printed as-is - nothing is assumed about its shape.
+# [providers.someone.balance]
+# url = "https://api.example.com/account/credits"
+
 # Model names are passed through to the active provider exactly as the client
 # sends them, so ask for whatever that provider serves - the proxy neither
 # renames models nor keeps a list of them.

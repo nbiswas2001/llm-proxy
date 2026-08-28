@@ -48,6 +48,18 @@ pub struct Provider {
     /// Extra headers sent upstream (values support "${ENV_VAR}").
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
+    /// Where `--balance` should look for this provider's remaining credit. Only
+    /// needed for a provider `balance.rs` has no built-in endpoint for.
+    pub balance: Option<BalanceEndpoint>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BalanceEndpoint {
+    /// Full URL, e.g. "https://api.example.com/account/credits". The provider's
+    /// key and headers are attached; the JSON that comes back is printed as-is,
+    /// since nothing is known about its shape. Supports "${ENV_VAR}".
+    pub url: String,
 }
 
 fn default_host() -> String {
@@ -161,6 +173,13 @@ impl Config {
         for (header, value) in &mut provider.headers {
             *value = expand_env(value)
                 .with_context(|| format!("provider \"{name}\": header {header}"))?;
+        }
+        if let Some(balance) = &mut provider.balance {
+            balance.url = expand_env(&balance.url)
+                .with_context(|| format!("provider \"{name}\": balance.url"))?;
+            if !balance.url.starts_with("http") {
+                bail!("provider \"{name}\": balance.url must start with http:// or https://");
+            }
         }
         Ok(())
     }

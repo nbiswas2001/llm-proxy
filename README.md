@@ -47,6 +47,8 @@ client.chat.completions.create(model="deepseek-chat", messages=[...], stream=Tru
 - **Nothing is rewritten.** The request body is forwarded byte for byte, model name
   included, so you ask for whatever the active provider serves.
 - **`GET /health`** returns `{"status":"ok"}`.
+- **`--balance`** prints the credit left on the active provider, for the providers that
+  publish such an endpoint.
 
 ## Configuration
 
@@ -108,15 +110,58 @@ gitignored; `.env.example` and `config.example.toml` are the tracked templates.
 | `api_key` | Literal key, or `"${ENV_VAR}"` / `"env:ENV_VAR"` to read the environment or `.env`. Omit for a provider that needs none. |
 | `api_key_env` | Alternative spelling: the name of the environment variable. |
 | `headers` | Extra headers sent upstream (values support `"${ENV_VAR}"`). |
+| `balance.url` | Balance endpoint for `--balance`, for a provider that is not built in. |
 
 ## CLI
 
 ```
-llm-proxy [-v|-vv] [--config <path>] [--env-file <path>] [--port <port>] [--host <addr>] [--check]
+llm-proxy [-v|-vv] [--config <path>] [--env-file <path>] [--port <port>] [--host <addr>]
+          [--check] [--balance]
 ```
 
 `--config` defaults to `config.toml` and also reads `LLM_PROXY_CONFIG`. `--check` validates
 the config and exits.
+
+### Remaining balance (`--balance`)
+
+`--balance` asks the **active** provider how much credit is left, prints it, and exits
+without binding a port:
+
+```
+$ llm-proxy --balance
+provider "deepseek" -> https://api.deepseek.com/user/balance
+  remaining            110.00 CNY
+  granted              10.00 CNY
+  topped up            100.00 CNY
+  accepting requests   yes
+```
+
+```
+$ llm-proxy --balance          # with openrouter active
+provider "openrouter" -> https://openrouter.ai/api/v1/credits
+  remaining            6.50 credits
+  granted              10.00 credits
+  used                 3.50 credits
+  key limit remaining  1.50
+```
+
+A balance API is **not part of the OpenAI protocol**, so this only works where the provider
+offers one. DeepSeek (`/user/balance`) and OpenRouter (`/api/v1/credits`, plus
+`/api/v1/key` for a key-scoped spend cap) are built in. OpenAI and Anthropic publish no
+balance endpoint at all, and a local server has no balance to report; those cases exit
+non-zero with an explanation rather than a number, so a script can tell them apart from a
+low balance.
+
+For any other provider that does document an endpoint, name it in the config:
+
+```toml
+[providers.someone.balance]
+url = "https://api.example.com/account/credits"
+```
+
+The provider's key and headers are attached to the request, and the JSON that comes back is
+pretty-printed as-is — nothing is assumed about its shape. An explicit `balance.url` also
+overrides the built-in endpoint, should one ever move.
 
 ### Watching traffic (`-v`)
 
@@ -143,4 +188,4 @@ overrides both (e.g. `LLM_PROXY_LOG=llm_proxy=trace,reqwest=debug`).
 - With `api_keys` empty the proxy is open to anyone who can reach the port. That is fine
   bound to `127.0.0.1`; set `api_keys` before binding `0.0.0.0`.
 - The proxy speaks plain HTTP. Put it behind a TLS terminator if it leaves the machine.
-- `cargo test` covers model routing, URL joining, and client auth.
+- `cargo test` covers model routing, URL joining, client auth, and balance parsing.

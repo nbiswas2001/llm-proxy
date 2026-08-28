@@ -18,14 +18,16 @@ tracing. `log_filter` in `main.rs` maps the count to a filter string, and `LLM_P
 overrides it entirely. Per-request logging lives at DEBUG so the default run stays quiet -
 new request-level logging belongs there too, not at INFO.
 `--port` / `--host` override the config file. Secrets live in a gitignored `.env`
-(`.env.example` is the template); `--env-file` points at a different one.
+(`.env.example` is the template); `--env-file` points at a different one. `--balance`
+queries the active provider's credit and exits, like `--check` binding nothing.
 
 Rust edition 2024; the code uses let-chains, so it needs a recent stable toolchain.
 
 ## Architecture
 
-Three files, one job: accept OpenAI-protocol requests on `:8600`, forward them to a
-configured upstream provider with the real API key attached, and stream the response back.
+One job: accept OpenAI-protocol requests on `:8600`, forward them to a configured upstream
+provider with the real API key attached, and stream the response back. Three files do that;
+`balance.rs` is a side errand that never runs while serving.
 
 **`src/proxy.rs` — the forwarder.** `proxy()` is registered as the router's `fallback`, not
 as a set of endpoint routes. That is deliberate: the proxy never needs to know which OpenAI
@@ -76,14 +78,32 @@ populated from `.env` (real environment variables win — `dotenvy` does not ove
 that resolves to empty is a startup error, since an unfilled `.env` line would otherwise
 send `Bearer ` upstream and fail as a confusing 401.
 
+**`src/balance.rs` — `--balance`.** The one place that is *not* protocol-agnostic: there is
+no balance endpoint in the OpenAI protocol, so this is per-provider knowledge. `known_for`
+matches on the **host** of `base_url` (not the whole URL) and yields a built-in endpoint plus
+a parser for its documented response — DeepSeek's `/user/balance`, OpenRouter's
+`/api/v1/credits` (with `/api/v1/key` as a best-effort second call for a key-scoped cap; its
+failure is logged at DEBUG and never sinks the report). Endpoints are built from the
+*origin* of `base_url`, since they sit beside `/v1` rather than under it — that is why
+`upstream_url` is not reused here. A `[providers.<name>.balance] url` in the config wins over
+the table and prints the raw JSON pretty-printed, which is the escape hatch for a provider
+the table does not know. The response structs are deliberately lenient (no
+`deny_unknown_fields`, unlike the config structs), so a new field upstream is not a parse
+error. Anything that fails — unknown provider, refused key, unexpected body — is an `Err`,
+so the flag is scriptable. Requests go out through `proxy::apply_provider_auth`, the same
+helper the forwarding path uses, so a provider's extra headers apply here too.
+
 **`src/main.rs`** loads `.env` *before* initializing logging — so `LLM_PROXY_LOG` can be set
 there too — then wires the CLI, builds the shared `reqwest::Client` (its `timeout` covers a
 whole streamed response, hence the 600s default), and constructs `AppState { config, http }`.
 
 ## Testing
 
-Unit tests live in `#[cfg(test)] mod tests` at the bottom of `src/config.rs` and cover
-routing precedence, URL joining, and client auth. There is no integration-test harness; to
+Unit tests live in `#[cfg(test)] mod tests` at the bottom of `src/config.rs` and
+`src/balance.rs`, and cover routing precedence, URL joining, client auth, and balance
+endpoint/response handling. The balance tests parse captured sample payloads and never touch
+the network — a new provider added to `known_for` should come with its documented payload as
+a test. There is no integration-test harness; to
 verify forwarding and streaming end to end, run a throwaway HTTP server that emits chunked
 SSE with a delay between chunks, point a config's `base_url` at it, and check that the
 client observes that same delay between chunks (buffering anywhere would collapse them).

@@ -1,3 +1,4 @@
+mod balance;
 mod config;
 mod proxy;
 
@@ -41,6 +42,10 @@ struct Cli {
     /// Validate the config and exit without binding a port.
     #[arg(long)]
     check: bool,
+    /// Print the credit left on the active provider and exit. Only providers
+    /// that publish a balance endpoint can answer this.
+    #[arg(long)]
+    balance: bool,
 }
 
 #[derive(Clone)]
@@ -112,6 +117,11 @@ async fn main() -> Result<()> {
         .user_agent(concat!("llm-proxy/", env!("CARGO_PKG_VERSION")))
         .build()
         .context("building the upstream HTTP client")?;
+
+    // Like --check, a query-and-exit mode: nothing is bound, nothing is served.
+    if cli.balance {
+        return balance::report(&config, &http).await;
+    }
 
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port)
         .parse()
