@@ -19,6 +19,11 @@ INFO llm_proxy: provider "deepseek" (default) -> https://api.deepseek.com/v1 [ap
 INFO llm_proxy: listening on http://0.0.0.0:8600/v1 (client auth: open)
 ```
 
+On Windows two batch files wrap the same thing: `build.bat` rebuilds
+`target\release\llm-proxy.exe` (and stops with `BUILD FAILED` rather than leaving you with a
+stale binary), and `run.bat` launches that binary with `-v`. Rebuild after pulling changes,
+since `run.bat` never compiles anything itself.
+
 Use it from any client:
 
 ```sh
