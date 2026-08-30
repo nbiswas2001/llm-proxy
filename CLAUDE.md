@@ -19,7 +19,9 @@ overrides it entirely. Per-request logging lives at DEBUG so the default run sta
 new request-level logging belongs there too, not at INFO.
 `--port` / `--host` override the config file. Secrets live in a gitignored `.env`
 (`.env.example` is the template); `--env-file` points at a different one. `--balance`
-queries the active provider's credit and exits, like `--check` binding nothing.
+queries the active provider's credit and exits, like `--check` binding nothing; it owns
+stdout, so its filter defaults to `off` and logging is written to stderr - keep the report
+itself on `println!` and everything else on `tracing`.
 
 Rust edition 2024; the code uses let-chains, so it needs a recent stable toolchain.
 

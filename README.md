@@ -155,7 +155,9 @@ offers one. DeepSeek (`/user/balance`) and OpenRouter (`/api/v1/credits`, plus
 `/api/v1/key` for a key-scoped spend cap) are built in. OpenAI and Anthropic publish no
 balance endpoint at all, and a local server has no balance to report; those cases exit
 non-zero with an explanation rather than a number, so a script can tell them apart from a
-low balance.
+low balance. The report is the only thing on stdout - startup logging is off for this flag,
+and anything `-v` turns on goes to stderr - so `llm-proxy --balance` can be piped straight
+into another command.
 
 For any other provider that does document an endpoint, name it in the config:
 
