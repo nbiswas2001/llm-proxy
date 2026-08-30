@@ -1,7 +1,7 @@
 @echo off
 set RUST_LOG=error
 :loop
-echo DeepSeek Balance:
+echo Account Balance:
 .\target\release\llm-proxy.exe --balance
 set /p "answer=Press ENTER to run again, or X to exit: "
 
