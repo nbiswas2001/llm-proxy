@@ -5,8 +5,8 @@ that speaks the OpenAI protocol). Point any OpenAI client at `http://localhost:8
 calls are forwarded to the configured provider with the real API key attached. Streaming
 responses are relayed chunk by chunk as they arrive — nothing is buffered.
 
-The proxy exposes whichever protocol the active provider speaks — every provider declares it
-as `api = "openai"` or `api = "anthropic"`. Nothing is translated between the two — see
+The proxy exposes whichever protocol the provider it is running as speaks — every provider
+declares it as `api = "openai"` or `api = "anthropic"`. Nothing is translated between the two — see
 [Claude](#claude-api--anthropic).
 
 ## Quick start
@@ -18,9 +18,13 @@ cargo run --release
 ```
 
 ```
-INFO llm_proxy: provider "deepseek" (default) -> https://api.deepseek.com/v1 [api key: yes]
+INFO llm_proxy: provider "deepseek" ACTIVE (default) -> https://api.deepseek.com/v1 [api key: yes]
+INFO llm_proxy: provider "claude" available
 INFO llm_proxy: listening on http://0.0.0.0:8600/v1 (client auth: open)
 ```
+
+`--provider <name>` runs a different one of the configured providers instead:
+`cargo run --release -- --provider claude`.
 
 On Windows two batch files wrap the same thing: `build.bat` rebuilds
 `target\release\llm-proxy.exe` (and stops with `BUILD FAILED` rather than leaving you with a
@@ -50,16 +54,16 @@ client.chat.completions.create(model="deepseek-chat", messages=[...], stream=Tru
   the client at the same pace the provider emits them.
 - **Keys stay server-side.** The client's `Authorization` header is dropped and replaced
   with the provider key from the config, so clients never hold a real key.
-- **One active provider.** Configure as many as you like; exactly one carries
-  `active = true` and receives every request. Switching provider is moving that flag.
+- **One provider per run.** Configure as many as you like; `--provider <name>` picks the
+  one that serves this run, and without it the one marked `default = true` does.
 - **Nothing is rewritten.** The request body is forwarded byte for byte, model name
   included, so you ask for whatever the active provider serves.
 - **`GET /health`** returns `{"status":"ok"}`.
 - **Claude too.** A provider with `api = "anthropic"` is authenticated with `x-api-key`
   instead of a bearer token, and the proxy then exposes Anthropic's Messages API rather
   than OpenAI's.
-- **`--balance`** prints the credit left on the active provider, for the providers that
-  publish such an endpoint.
+- **`--balance`** prints the credit left on the provider this run selected, for the
+  providers that publish such an endpoint.
 
 ## Configuration
 
@@ -67,23 +71,34 @@ See `config.example.toml` for the annotated version. Minimum viable config:
 
 ```toml
 [providers.deepseek]
-active = true
+default = true
 api = "openai"
 base_url = "https://api.deepseek.com/v1"
 api_key = "${DEEPSEEK_API_KEY}"
 ```
 
-**Exactly one provider must set `active = true`.** That one receives every request; the
-rest are ignored entirely, including their API keys — so an inactive provider may reference
-a key you have not set yet. Zero active providers, or two, is a startup error naming them:
+**One provider serves each run.** `--provider <name>` names it; with no flag, the one
+marked `default = true` is used. Everything else in the file is ignored entirely, API keys
+included — so an unused provider may reference a key you have not set yet:
+
+```sh
+llm-proxy                        # the default provider
+llm-proxy --provider openrouter  # this run only; LLM_PROXY_PROVIDER works too
+```
+
+At most one provider may set `default = true`; a name that is not in the file, or a missing
+default with no `--provider`, is a startup error listing what is there:
 
 ```
-Error: providers deepseek, llamacpp are all active; exactly one may set active = true
-Error: no provider is active; set active = true on exactly one of: deepseek, llamacpp
+Error: providers deepseek, llamacpp are all marked default; at most one may set default = true
+Error: --provider "llamacp" is not in the config; available: claude, deepseek, llamacpp
+Error: no default provider; set default = true on one of: deepseek, llamacpp, or name one with --provider
 ```
 
-Switching provider means moving the flag and restarting. Model names go to the active
-provider untouched — the proxy neither renames models nor keeps a list of them.
+Model names go to the chosen provider untouched — the proxy neither renames models nor
+keeps a list of them. That provider is the **active** one for the run: what the startup log
+and the rest of this README mean by the word, whether it got there by `default = true` or by
+`--provider`.
 
 **Every provider must also declare `api`**, the wire protocol it speaks — `"openai"` for
 almost everything, `"anthropic"` for Claude. There is no default: the wrong guess surfaces
@@ -136,7 +151,7 @@ gitignored; `.env.example` and `config.example.toml` are the tracked templates.
 
 | Key | Meaning |
 | --- | --- |
-| `active` | Exactly one provider must set this to `true`. |
+| `default` | Marks the provider used when `--provider` names none. At most one may set it. |
 | `base_url` | Upstream API root, e.g. `https://api.deepseek.com/v1`. |
 | `api` | **Required.** Wire protocol: `"openai"` or `"anthropic"`. See [Claude](#claude-api--anthropic). |
 | `api_key` | Literal key, or `"${ENV_VAR}"` / `"env:ENV_VAR"` to read the environment or `.env`. Omit for a provider that needs none. |
@@ -150,7 +165,7 @@ Anthropic's API is not OpenAI-shaped, so a Claude provider says so:
 
 ```toml
 [providers.claude]
-active = true
+default = true
 api = "anthropic"
 base_url = "https://api.anthropic.com/v1"
 api_key = "${ANTHROPIC_API_KEY}"
@@ -185,16 +200,18 @@ here either — Anthropic publishes no balance endpoint.
 ## CLI
 
 ```
-llm-proxy [-v|-vv] [--config <path>] [--env-file <path>] [--port <port>] [--host <addr>]
-          [--check] [--balance]
+llm-proxy [-v|-vv] [--provider <name>] [--config <path>] [--env-file <path>]
+          [--port <port>] [--host <addr>] [--check] [--balance]
 ```
 
-`--config` defaults to `config.toml` and also reads `LLM_PROXY_CONFIG`. `--check` validates
-the config and exits.
+`--config` defaults to `config.toml` and also reads `LLM_PROXY_CONFIG`. `--provider` picks
+the provider for this run by its config section name, overriding `default = true`, and also
+reads `LLM_PROXY_PROVIDER`. `--check` validates the config and exits.
 
 ### Remaining balance (`--balance`)
 
-`--balance` asks the **active** provider how much credit is left, prints it, and exits
+`--balance` asks the provider serving this run — the default one, or whichever
+`--provider` names — how much credit is left, prints it, and exits
 without binding a port:
 
 ```
@@ -207,7 +224,7 @@ provider "deepseek" -> https://api.deepseek.com/user/balance
 ```
 
 ```
-$ llm-proxy --balance          # with openrouter active
+$ llm-proxy --provider openrouter --balance
 provider "openrouter" -> https://openrouter.ai/api/v1/credits
   remaining            6.50 credits
   granted              10.00 credits

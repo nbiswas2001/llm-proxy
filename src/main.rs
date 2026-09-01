@@ -25,6 +25,10 @@ struct Cli {
     /// Path to the TOML config file.
     #[arg(short, long, default_value = "config.toml", env = "LLM_PROXY_CONFIG")]
     config: PathBuf,
+    /// Provider to use for this run, by its [providers.<name>] section name.
+    /// Without it, the provider marked `default = true` serves the run.
+    #[arg(long, env = "LLM_PROXY_PROVIDER")]
+    provider: Option<String>,
     /// Override the port from the config file.
     #[arg(short, long)]
     port: Option<u16>,
@@ -86,7 +90,7 @@ async fn main() -> Result<()> {
             cli.config.display()
         );
     }
-    let mut config = Config::load(&cli.config)?;
+    let mut config = Config::load(&cli.config, cli.provider.as_deref())?;
     if let Some(port) = cli.port {
         config.server.port = port;
     }
@@ -94,10 +98,16 @@ async fn main() -> Result<()> {
         config.server.host = host;
     }
 
+    let chosen_by = if cli.provider.is_some() {
+        "--provider"
+    } else {
+        "default"
+    };
+    let (active_name, _) = config.active();
     for (name, provider) in &config.providers {
-        if provider.active {
+        if name == active_name {
             info!(
-                "provider \"{name}\" ACTIVE -> {} [api key: {}]",
+                "provider \"{name}\" ACTIVE ({chosen_by}) -> {} [api key: {}]",
                 provider.base_url,
                 if provider.api_key.is_some() {
                     "yes"
@@ -106,7 +116,7 @@ async fn main() -> Result<()> {
                 }
             );
         } else {
-            info!("provider \"{name}\" inactive");
+            info!("provider \"{name}\" available");
         }
     }
 

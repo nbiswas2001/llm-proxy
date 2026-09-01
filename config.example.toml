@@ -1,10 +1,10 @@
 # llm-proxy configuration.
 # Copy to config.toml and fill in your keys, then run: llm-proxy
 #
-# Exactly one provider must have active = true. That provider receives every
-# request; the others are ignored entirely - an inactive provider may even
-# reference an API key you have not set yet. To switch providers, move the flag.
-# Zero active providers, or two, is a startup error naming the offenders.
+# One provider serves each run. `llm-proxy --provider <name>` picks it; without
+# that flag the one marked default = true is used. Only that provider is touched -
+# the others are ignored entirely, and may even reference an API key you have not
+# set yet. Two providers marked default is a startup error naming them.
 
 [server]
 host = "0.0.0.0"           # use "127.0.0.1" to accept local clients only
@@ -17,7 +17,7 @@ max_body_mb = 64
 api_keys = []
 
 [providers.deepseek]
-active = true
+default = true
 api = "openai"
 base_url = "https://api.deepseek.com/v1"
 # Either a literal key, or "${ENV_VAR}" / "env:ENV_VAR" to read it from the environment
@@ -27,25 +27,26 @@ api_key = "${DEEPSEEK_API_KEY}"
 # A local server needs no key at all. Start llama.cpp with e.g.
 #   llama-server -m model.gguf --port 8503
 [providers.llamacpp]
-active = false
+default = false
 api = "openai"
 base_url = "http://127.0.0.1:8503/v1"
 
-# Claude. `api = "anthropic"` switches the wire protocol: the key goes upstream as
+# Claude - run it with `llm-proxy --provider claude`.
+# `api = "anthropic"` switches the wire protocol: the key goes upstream as
 # `x-api-key` rather than a bearer token, and `anthropic-version` is filled in when
 # the caller does not send one. Bodies are still forwarded byte for byte, so while
 # this provider is active the proxy speaks Anthropic's Messages API (POST /v1/messages)
 # and clients must too - an OpenAI-shaped request will be rejected by Anthropic, not
 # translated here.
 [providers.claude]
-active = false
+default = false
 api = "anthropic"
 base_url = "https://api.anthropic.com/v1"
 api_key = "${ANTHROPIC_API_KEY}"
 
 # Some providers want extra headers.
 [providers.openrouter]
-active = false
+default = false
 api = "openai"
 base_url = "https://openrouter.ai/api/v1"
 api_key = "${OPENROUTER_API_KEY}"
@@ -54,7 +55,8 @@ api_key = "${OPENROUTER_API_KEY}"
 "HTTP-Referer" = "http://localhost:8600"
 "X-Title" = "llm-proxy"
 
-# `llm-proxy --balance` prints the credit left on the active provider and exits.
+# `llm-proxy --balance` prints the credit left on the provider that run selected
+# (the default one, or whatever --provider named) and exits.
 # DeepSeek and OpenRouter are built in; a balance API is not part of the OpenAI
 # protocol, so for any other provider that offers one, name its endpoint here.
 # The provider's key and headers are attached, and the JSON that comes back is
@@ -62,6 +64,6 @@ api_key = "${OPENROUTER_API_KEY}"
 # [providers.someone.balance]
 # url = "https://api.example.com/account/credits"
 
-# Model names are passed through to the active provider exactly as the client
+# Model names are passed through to the chosen provider exactly as the client
 # sends them, so ask for whatever that provider serves - the proxy neither
 # renames models nor keeps a list of them.

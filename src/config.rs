@@ -9,7 +9,8 @@ pub struct Config {
     #[serde(default)]
     pub server: ServerConfig,
     pub providers: BTreeMap<String, Provider>,
-    /// Name of the one provider with `active = true`, resolved at load time.
+    /// The provider serving this run: `--provider` if it named one, otherwise the
+    /// one marked `default = true`. Resolved at load time.
     #[serde(skip)]
     active_name: String,
 }
@@ -36,9 +37,10 @@ pub struct ServerConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Provider {
-    /// Exactly one provider in the file must set this.
-    #[serde(default)]
-    pub active: bool,
+    /// The provider used when the command line does not name one. At most one
+    /// provider in the file may set it.
+    #[serde(default, rename = "default")]
+    pub is_default: bool,
     /// e.g. "https://api.deepseek.com/v1"
     pub base_url: String,
     /// Literal key, or "${ENV_VAR}" to read it from the environment or .env file.
@@ -109,24 +111,26 @@ impl Default for ServerConfig {
 }
 
 impl Config {
-    pub fn load(path: &Path) -> Result<Self> {
+    /// `chosen` is the `--provider` name, when one was given; otherwise the
+    /// provider marked `default = true` serves the run.
+    pub fn load(path: &Path, chosen: Option<&str>) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
         let mut config =
             parse(&text).with_context(|| format!("parsing config file {}", path.display()))?;
-        config.validate_and_expand()?;
+        config.validate_and_expand(chosen)?;
         Ok(config)
     }
 
-    fn validate_and_expand(&mut self) -> Result<()> {
+    fn validate_and_expand(&mut self, chosen: Option<&str>) -> Result<()> {
         if self.providers.is_empty() {
             bail!("config defines no [providers.<name>] sections");
         }
 
-        let active: Vec<&str> = self
+        let defaults: Vec<&str> = self
             .providers
             .iter()
-            .filter(|(_, provider)| provider.active)
+            .filter(|(_, provider)| provider.is_default)
             .map(|(name, _)| name.as_str())
             .collect();
         let all = |config: &Self| {
@@ -137,17 +141,30 @@ impl Config {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        match active.len() {
-            1 => self.active_name = active[0].to_string(),
-            0 => bail!(
-                "no provider is active; set active = true on exactly one of: {}",
+        // Two defaults is an ambiguous file however the run was started.
+        if defaults.len() > 1 {
+            bail!(
+                "providers {} are all marked default; at most one may set default = true",
+                defaults.join(", ")
+            );
+        }
+        self.active_name = match chosen {
+            // A named provider wins; a name that is not in the file is a typo
+            // worth stopping for, not a reason to fall back to the default.
+            Some(name) if self.providers.contains_key(name) => name.to_string(),
+            Some(name) => bail!(
+                "--provider \"{name}\" is not in the config; available: {}",
                 all(self)
             ),
-            _ => bail!(
-                "providers {} are all active; exactly one may set active = true",
-                active.join(", ")
-            ),
-        }
+            None => match defaults.first() {
+                Some(name) => name.to_string(),
+                None => bail!(
+                    "no default provider; set default = true on one of: {}, \
+                     or name one with --provider",
+                    all(self)
+                ),
+            },
+        };
 
         // Only the active provider is validated: an inactive one may reference a key
         // that is not present, which is what makes commenting-in a provider cheap.
@@ -201,7 +218,7 @@ impl Config {
         Ok(())
     }
 
-    /// The single provider every request is forwarded to.
+    /// The single provider every request of this run is forwarded to.
     pub fn active(&self) -> (&str, &Provider) {
         let provider = self
             .providers
@@ -220,7 +237,7 @@ impl Config {
         {
             return Err(format!(
                 "model \"{model}\" names provider \"{prefix}\", but \"{}\" is the active one; \
-                 drop the \"{prefix}:\" prefix, or make \"{prefix}\" the active provider in the config",
+                 drop the \"{prefix}:\" prefix, or start with --provider {prefix}",
                 self.active_name
             ));
         }
@@ -275,9 +292,11 @@ impl Provider {
 /// config is most likely to be missing.
 fn parse(text: &str) -> Result<Config> {
     toml::from_str(text).map_err(|err| {
-        let hint = if err.to_string().contains("missing field `api`") {
-            "
-hint: every [providers.<name>] sets api = \"openai\", or \"anthropic\" for Claude"
+        let message = err.to_string();
+        let hint = if message.contains("missing field `api`") {
+            "\nhint: every [providers.<name>] sets api = \"openai\", or \"anthropic\" for Claude"
+        } else if message.contains("unknown field `active`") {
+            "\nhint: `active` is now `default` - the provider used when --provider names none"
         } else {
             ""
         };
@@ -304,14 +323,18 @@ mod tests {
     use super::*;
 
     fn load(toml_text: &str) -> Result<Config> {
+        select(toml_text, None)
+    }
+
+    fn select(toml_text: &str, chosen: Option<&str>) -> Result<Config> {
         let mut config = parse(toml_text).expect("parse");
-        config.validate_and_expand()?;
+        config.validate_and_expand(chosen)?;
         Ok(config)
     }
 
     const TWO_PROVIDERS: &str = r#"
 [providers.deepseek]
-active = true
+default = true
 api = "openai"
 base_url = "https://api.deepseek.com/v1"
 api_key = "test"
@@ -331,7 +354,7 @@ base_url = "http://127.0.0.1:8503/v1"
         let claude = load(
             r#"
 [providers.claude]
-active = true
+default = true
 api = "anthropic"
 base_url = "https://api.anthropic.com/v1"
 api_key = "sk-ant-test"
@@ -348,7 +371,7 @@ api_key = "sk-ant-test"
         let error = parse(
             r#"
 [providers.deepseek]
-active = true
+default = true
 base_url = "https://api.deepseek.com/v1"
 "#,
         )
@@ -363,7 +386,7 @@ base_url = "https://api.deepseek.com/v1"
         let error = parse(
             r#"
 [providers.claude]
-active = true
+default = true
 api = "gemini"
 base_url = "https://example.com/v1"
 "#,
@@ -381,22 +404,40 @@ base_url = "https://example.com/v1"
     }
 
     #[test]
-    fn two_active_providers_are_rejected() {
+    fn two_default_providers_are_rejected() {
         let toml_text = TWO_PROVIDERS.replace(
             "[providers.llamacpp]\napi",
-            "[providers.llamacpp]\nactive = true\napi",
+            "[providers.llamacpp]\ndefault = true\napi",
         );
         let err = load(&toml_text).unwrap_err().to_string();
         assert!(err.contains("deepseek, llamacpp"), "{err}");
-        assert!(err.contains("exactly one"), "{err}");
+        assert!(err.contains("at most one"), "{err}");
     }
 
     #[test]
-    fn no_active_provider_is_rejected() {
-        let toml_text = TWO_PROVIDERS.replace("active = true\n", "");
-        let err = load(&toml_text).unwrap_err().to_string();
-        assert!(err.contains("no provider is active"), "{err}");
+    fn a_named_provider_wins_over_the_default() {
+        let config = select(TWO_PROVIDERS, Some("llamacpp")).unwrap();
+        assert_eq!(config.active().0, "llamacpp");
+    }
+
+    #[test]
+    fn a_provider_name_that_is_not_in_the_config_is_an_error() {
+        let err = select(TWO_PROVIDERS, Some("llamacp"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not in the config"), "{err}");
         assert!(err.contains("deepseek, llamacpp"), "{err}");
+    }
+
+    #[test]
+    fn a_default_is_needed_only_when_no_provider_is_named() {
+        let toml_text = TWO_PROVIDERS.replace("default = true\n", "");
+        let err = load(&toml_text).unwrap_err().to_string();
+        assert!(err.contains("no default provider"), "{err}");
+        assert!(err.contains("deepseek, llamacpp"), "{err}");
+        // ... but the run is fine when the command line names one.
+        let config = select(&toml_text, Some("llamacpp")).unwrap();
+        assert_eq!(config.active().0, "llamacpp");
     }
 
     #[test]
@@ -405,7 +446,7 @@ base_url = "https://example.com/v1"
         let config = load(
             r#"
 [providers.deepseek]
-active = true
+default = true
 api = "openai"
 base_url = "https://api.deepseek.com/v1"
 api_key = "test"
@@ -426,7 +467,7 @@ api_key = "${DEFINITELY_NOT_SET_12345}"
         let err = load(
             r#"
 [providers.deepseek]
-active = true
+default = true
 api = "openai"
 base_url = "https://api.deepseek.com/v1"
 api_key = "${LLM_PROXY_TEST_BLANK}"
@@ -442,6 +483,7 @@ api_key = "${LLM_PROXY_TEST_BLANK}"
         let config = load(TWO_PROVIDERS).unwrap();
         let err = config.reject_stale_prefix("llamacpp:qwen").unwrap_err();
         assert!(err.contains("\"deepseek\" is the active one"), "{err}");
+        assert!(err.contains("--provider llamacpp"), "{err}");
     }
 
     #[test]
@@ -472,7 +514,7 @@ api_key = "${LLM_PROXY_TEST_BLANK}"
         let config = load(
             r#"
 [providers.local]
-active = true
+default = true
 api = "openai"
 base_url = "http://localhost:11434"
 "#,
