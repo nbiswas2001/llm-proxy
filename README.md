@@ -1,10 +1,13 @@
 # llm-proxy
 
-An OpenAI-compatible HTTP proxy in front of online LLM APIs (DeepSeek, OpenRouter, or
-anything else that speaks the OpenAI protocol). Point any OpenAI client at
-`http://localhost:8600/v1`, and calls are forwarded to the configured provider with the
-real API key attached. Streaming responses are relayed chunk by chunk as they arrive —
-nothing is buffered.
+An HTTP proxy in front of online LLM APIs (DeepSeek, OpenRouter, Claude, or anything else
+that speaks the OpenAI protocol). Point any OpenAI client at `http://localhost:8600/v1`, and
+calls are forwarded to the configured provider with the real API key attached. Streaming
+responses are relayed chunk by chunk as they arrive — nothing is buffered.
+
+The proxy exposes whichever protocol the active provider speaks — every provider declares it
+as `api = "openai"` or `api = "anthropic"`. Nothing is translated between the two — see
+[Claude](#claude-api--anthropic).
 
 ## Quick start
 
@@ -52,6 +55,9 @@ client.chat.completions.create(model="deepseek-chat", messages=[...], stream=Tru
 - **Nothing is rewritten.** The request body is forwarded byte for byte, model name
   included, so you ask for whatever the active provider serves.
 - **`GET /health`** returns `{"status":"ok"}`.
+- **Claude too.** A provider with `api = "anthropic"` is authenticated with `x-api-key`
+  instead of a bearer token, and the proxy then exposes Anthropic's Messages API rather
+  than OpenAI's.
 - **`--balance`** prints the credit left on the active provider, for the providers that
   publish such an endpoint.
 
@@ -62,6 +68,7 @@ See `config.example.toml` for the annotated version. Minimum viable config:
 ```toml
 [providers.deepseek]
 active = true
+api = "openai"
 base_url = "https://api.deepseek.com/v1"
 api_key = "${DEEPSEEK_API_KEY}"
 ```
@@ -78,6 +85,24 @@ Error: no provider is active; set active = true on exactly one of: deepseek, lla
 Switching provider means moving the flag and restarting. Model names go to the active
 provider untouched — the proxy neither renames models nor keeps a list of them.
 
+**Every provider must also declare `api`**, the wire protocol it speaks — `"openai"` for
+almost everything, `"anthropic"` for Claude. There is no default: the wrong guess surfaces
+as a 401 from upstream rather than a startup error, so the file says it outright. A provider
+missing the field fails to load, pointing at the table:
+
+```
+Error: parsing config file config.toml
+
+Caused by:
+    TOML parse error at line 19, column 1
+      |
+   19 | [providers.deepseek]
+      | ^^^^^^^^^^^^^^^^^^^^
+    missing field `api`
+
+    hint: every [providers.<name>] sets api = "openai", or "anthropic" for Claude
+```
+
 ### API keys and `.env`
 
 Keys are kept out of `config.toml` by writing `"${DEEPSEEK_API_KEY}"` and putting the value
@@ -86,6 +111,7 @@ in a `.env` file:
 ```
 DEEPSEEK_API_KEY=sk-...
 OPENROUTER_API_KEY=sk-...
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
 The proxy loads `.env` from beside the config file, falling back to the nearest `.env` from
@@ -112,10 +138,49 @@ gitignored; `.env.example` and `config.example.toml` are the tracked templates.
 | --- | --- |
 | `active` | Exactly one provider must set this to `true`. |
 | `base_url` | Upstream API root, e.g. `https://api.deepseek.com/v1`. |
+| `api` | **Required.** Wire protocol: `"openai"` or `"anthropic"`. See [Claude](#claude-api--anthropic). |
 | `api_key` | Literal key, or `"${ENV_VAR}"` / `"env:ENV_VAR"` to read the environment or `.env`. Omit for a provider that needs none. |
 | `api_key_env` | Alternative spelling: the name of the environment variable. |
 | `headers` | Extra headers sent upstream (values support `"${ENV_VAR}"`). |
 | `balance.url` | Balance endpoint for `--balance`, for a provider that is not built in. |
+
+### Claude (`api = "anthropic"`)
+
+Anthropic's API is not OpenAI-shaped, so a Claude provider says so:
+
+```toml
+[providers.claude]
+active = true
+api = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key = "${ANTHROPIC_API_KEY}"
+```
+
+Two things change, and only two: the key goes upstream as `x-api-key: <key>` rather than
+`Authorization: Bearer <key>`, and `anthropic-version: 2023-06-01` is added when the caller
+does not send one (a client that pins its own version keeps it). Everything else is the
+usual pass-through — the body is forwarded byte for byte, `anthropic-beta` and the rest of
+the headers ride along, and streaming is relayed the same way.
+
+Because nothing is translated, **the proxy speaks Anthropic's protocol while this provider
+is active**, and clients must too:
+
+```sh
+curl http://localhost:8600/v1/messages   -H "Content-Type: application/json"   -d '{"model":"claude-opus-4-6","max_tokens":1024,
+       "messages":[{"role":"user","content":"hi"}]}'
+```
+
+```python
+from anthropic import Anthropic
+client = Anthropic(base_url="http://localhost:8600", api_key="unused")
+client.messages.create(model="claude-opus-4-6", max_tokens=1024, messages=[...])
+```
+
+An OpenAI-shaped request sent while Claude is active is rejected by Anthropic, not converted
+here. (Anthropic also serves an OpenAI-compatible endpoint; to use *that*, set
+`api = "openai"` and point `base_url` at it as with any other provider — which is why the
+field is stated per provider rather than guessed from the host.) `--balance` cannot help
+here either — Anthropic publishes no balance endpoint.
 
 ## CLI
 

@@ -45,12 +45,29 @@ pub struct Provider {
     pub api_key: Option<String>,
     /// Alternative to `api_key`: name of an environment variable holding the key.
     pub api_key_env: Option<String>,
+    /// Wire protocol this provider speaks, and therefore the one clients of the
+    /// proxy must speak while it is active. Bodies are forwarded untouched
+    /// either way; what differs is how the key is presented upstream. Required:
+    /// getting it wrong is a 401 from upstream, so every provider states it.
+    pub api: Api,
     /// Extra headers sent upstream (values support "${ENV_VAR}").
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// Where `--balance` should look for this provider's remaining credit. Only
     /// needed for a provider `balance.rs` has no built-in endpoint for.
     pub balance: Option<BalanceEndpoint>,
+}
+
+/// The two request protocols in circulation. There is no translation between
+/// them: `api = "anthropic"` means the proxy exposes Anthropic's Messages API,
+/// so clients must speak it too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Api {
+    /// `Authorization: Bearer <key>`, the shape everything else here uses.
+    Openai,
+    /// `x-api-key: <key>` plus the `anthropic-version` header their API requires.
+    Anthropic,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,8 +112,8 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("reading config file {}", path.display()))?;
-        let mut config: Config = toml::from_str(&text)
-            .with_context(|| format!("parsing config file {}", path.display()))?;
+        let mut config =
+            parse(&text).with_context(|| format!("parsing config file {}", path.display()))?;
         config.validate_and_expand()?;
         Ok(config)
     }
@@ -240,6 +257,32 @@ impl Provider {
     pub fn api_key(&self) -> Option<&str> {
         self.api_key.as_deref()
     }
+
+    pub fn is_anthropic(&self) -> bool {
+        self.api == Api::Anthropic
+    }
+
+    /// Whether the config already pins Anthropic's version header, in which case
+    /// the proxy must not add its own default on top.
+    pub fn sets_anthropic_version(&self) -> bool {
+        self.headers
+            .keys()
+            .any(|name| name.eq_ignore_ascii_case("anthropic-version"))
+    }
+}
+
+/// Deserialize the file, spelling out the one required field a hand-written
+/// config is most likely to be missing.
+fn parse(text: &str) -> Result<Config> {
+    toml::from_str(text).map_err(|err| {
+        let hint = if err.to_string().contains("missing field `api`") {
+            "
+hint: every [providers.<name>] sets api = \"openai\", or \"anthropic\" for Claude"
+        } else {
+            ""
+        };
+        anyhow::anyhow!("{err}{hint}")
+    })
 }
 
 /// Replace a whole-string `${VAR}` (or `env:VAR`) with the environment value.
@@ -261,7 +304,7 @@ mod tests {
     use super::*;
 
     fn load(toml_text: &str) -> Result<Config> {
-        let mut config: Config = toml::from_str(toml_text).expect("parse");
+        let mut config = parse(toml_text).expect("parse");
         config.validate_and_expand()?;
         Ok(config)
     }
@@ -269,12 +312,65 @@ mod tests {
     const TWO_PROVIDERS: &str = r#"
 [providers.deepseek]
 active = true
+api = "openai"
 base_url = "https://api.deepseek.com/v1"
 api_key = "test"
 
 [providers.llamacpp]
+api = "openai"
 base_url = "http://127.0.0.1:8503/v1"
 "#;
+
+    #[test]
+    fn every_provider_states_the_protocol_it_speaks() {
+        let config = load(TWO_PROVIDERS).expect("valid");
+        let (_, deepseek) = config.active();
+        assert_eq!(deepseek.api, Api::Openai);
+        assert!(!deepseek.is_anthropic());
+
+        let claude = load(
+            r#"
+[providers.claude]
+active = true
+api = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-ant-test"
+"#,
+        )
+        .expect("valid");
+        assert!(claude.active().1.is_anthropic());
+    }
+
+    #[test]
+    fn a_provider_with_no_api_field_is_rejected() {
+        // Including an inactive one: the whole file is deserialized, and guessing
+        // the protocol would show up as a 401 from upstream rather than here.
+        let error = parse(
+            r#"
+[providers.deepseek]
+active = true
+base_url = "https://api.deepseek.com/v1"
+"#,
+        )
+        .expect_err("missing api")
+        .to_string();
+        assert!(error.contains("missing field `api`"), "{error}");
+        assert!(error.contains("anthropic"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_api_flavor_is_a_startup_error() {
+        let error = parse(
+            r#"
+[providers.claude]
+active = true
+api = "gemini"
+base_url = "https://example.com/v1"
+"#,
+        )
+        .expect_err("unknown flavor");
+        assert!(error.to_string().contains("anthropic"), "{error}");
+    }
 
     #[test]
     fn the_active_provider_receives_every_request() {
@@ -287,8 +383,8 @@ base_url = "http://127.0.0.1:8503/v1"
     #[test]
     fn two_active_providers_are_rejected() {
         let toml_text = TWO_PROVIDERS.replace(
-            "[providers.llamacpp]\nbase_url",
-            "[providers.llamacpp]\nactive = true\nbase_url",
+            "[providers.llamacpp]\napi",
+            "[providers.llamacpp]\nactive = true\napi",
         );
         let err = load(&toml_text).unwrap_err().to_string();
         assert!(err.contains("deepseek, llamacpp"), "{err}");
@@ -310,10 +406,12 @@ base_url = "http://127.0.0.1:8503/v1"
             r#"
 [providers.deepseek]
 active = true
+api = "openai"
 base_url = "https://api.deepseek.com/v1"
 api_key = "test"
 
 [providers.openrouter]
+api = "openai"
 base_url = "https://openrouter.ai/api/v1"
 api_key = "${DEFINITELY_NOT_SET_12345}"
 "#,
@@ -329,6 +427,7 @@ api_key = "${DEFINITELY_NOT_SET_12345}"
             r#"
 [providers.deepseek]
 active = true
+api = "openai"
 base_url = "https://api.deepseek.com/v1"
 api_key = "${LLM_PROXY_TEST_BLANK}"
 "#,
@@ -374,6 +473,7 @@ api_key = "${LLM_PROXY_TEST_BLANK}"
             r#"
 [providers.local]
 active = true
+api = "openai"
 base_url = "http://localhost:11434"
 "#,
         )

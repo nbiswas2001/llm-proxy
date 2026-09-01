@@ -27,9 +27,11 @@ Rust edition 2024; the code uses let-chains, so it needs a recent stable toolcha
 
 ## Architecture
 
-One job: accept OpenAI-protocol requests on `:8600`, forward them to a configured upstream
-provider with the real API key attached, and stream the response back. Three files do that;
-`balance.rs` is a side errand that never runs while serving.
+One job: accept requests on `:8600`, forward them to a configured upstream provider with the
+real API key attached, and stream the response back. The protocol on the way in is whatever
+the active provider speaks - OpenAI's, or Anthropic's when it is marked `api = "anthropic"`;
+nothing is translated between them. Three files do that; `balance.rs` is a side errand that
+never runs while serving.
 
 **`src/proxy.rs` — the forwarder.** `proxy()` is registered as the router's `fallback`, not
 as a set of endpoint routes. That is deliberate: the proxy never needs to know which OpenAI
@@ -45,11 +47,19 @@ The request lifecycle:
 3. The body is forwarded unchanged to `Config::active()`; the parse above only feeds the
    log line and the streaming-header decision.
 4. Headers are copied minus `STRIPPED_REQUEST_HEADERS` + `HOP_BY_HOP`; the client's
-   `Authorization` is dropped and replaced with the provider's key. `accept-encoding` is
-   stripped so upstream never compresses a stream we relay.
+   `Authorization` and `x-api-key` are dropped and replaced with the provider's key -
+   as a bearer token, or as `x-api-key` when the provider is `api = "anthropic"`.
+   `accept-encoding` is stripped so upstream never compresses a stream we relay.
 5. The response is re-framed as `Body::from_stream(...)` — this is what makes streaming
    incremental rather than buffered. Because the body is re-framed, `content-length` must be
    dropped from the response headers (`is_stripped_response_header`).
+
+An Anthropic provider is the one place a header is *invented*: `needs_anthropic_version`
+adds `anthropic-version: 2023-06-01` only when neither the client nor
+`[providers.<name>.headers]` supplied one, since a second copy of that header is an upstream
+400 and a client pinning a version must keep its own. That is the entire extent of protocol awareness in `proxy.rs` -
+the body is still forwarded byte for byte, so an Anthropic-shaped request only works
+because the client sent one.
 
 The body is wrapped in `LoggedStream`, which counts bytes and chunks as they pass and logs
 once the stream ends. Its `Drop` impl covers the client-hangup case, which `poll_next` never
@@ -68,6 +78,16 @@ model routing, alias table, or model list: the request body, model name included
 forwarded byte for byte. `reject_stale_prefix` exists only to catch a leftover
 `"<provider>:<model>"` name from an inactive provider and answer with a clear 400 instead of
 passing a nonsense model upstream.
+
+`Provider::api` (`Api::Openai` / `Api::Anthropic`) is the only protocol knowledge in the
+config: it picks the auth header in `proxy::apply_provider_auth` and gates the version
+default. It is *required* on every provider, with no serde default - inferring it from the
+host would be wrong for Anthropic's own OpenAI-compatible endpoint, and a wrong guess shows
+up as a 401 from upstream rather than a startup error. Because the whole file is
+deserialized (only *validation* is scoped to the active provider), an inactive provider
+needs the field too. `parse` appends a hint to the bare "missing field `api`" that serde
+produces; it is the only error message the config module dresses up, which is what a
+mandatory field with two legal values earns.
 
 `Provider::upstream_url` joins `base_url` with the request path while collapsing a duplicated
 version segment (base `.../v1` + path `/v1/chat/completions` must not yield `/v1/v1/...`).
@@ -101,11 +121,15 @@ whole streamed response, hence the 600s default), and constructs `AppState { con
 
 ## Testing
 
-Unit tests live in `#[cfg(test)] mod tests` at the bottom of `src/config.rs` and
-`src/balance.rs`, and cover routing precedence, URL joining, client auth, and balance
-endpoint/response handling. The balance tests parse captured sample payloads and never touch
-the network — a new provider added to `known_for` should come with its documented payload as
-a test. There is no integration-test harness; to
-verify forwarding and streaming end to end, run a throwaway HTTP server that emits chunked
-SSE with a delay between chunks, point a config's `base_url` at it, and check that the
-client observes that same delay between chunks (buffering anywhere would collapse them).
+Unit tests live in `#[cfg(test)] mod tests` at the bottom of `src/config.rs`,
+`src/proxy.rs`, and `src/balance.rs`, and cover routing precedence, URL joining, client
+auth, the per-protocol auth headers, and balance endpoint/response handling. The proxy
+tests build a `reqwest` request and inspect its headers, so they need no server. The balance
+tests parse captured sample payloads and never touch the network — a new provider added to
+`known_for` should come with its documented payload as a test. There is no integration-test
+harness; to verify forwarding and streaming end to end, run a throwaway HTTP server that
+emits chunked SSE with a delay between chunks, point a config's `base_url` at it, and check
+that the client observes that same delay between chunks (buffering anywhere would collapse
+them).
+The same trick, with a server that echoes back the headers it received, is how the Anthropic
+header shaping was checked against a running proxy.

@@ -18,6 +18,7 @@ api_keys = []
 
 [providers.deepseek]
 active = true
+api = "openai"
 base_url = "https://api.deepseek.com/v1"
 # Either a literal key, or "${ENV_VAR}" / "env:ENV_VAR" to read it from the environment
 # or from the .env file beside this config (see .env.example).
@@ -27,11 +28,25 @@ api_key = "${DEEPSEEK_API_KEY}"
 #   llama-server -m model.gguf --port 8503
 [providers.llamacpp]
 active = false
+api = "openai"
 base_url = "http://127.0.0.1:8503/v1"
+
+# Claude. `api = "anthropic"` switches the wire protocol: the key goes upstream as
+# `x-api-key` rather than a bearer token, and `anthropic-version` is filled in when
+# the caller does not send one. Bodies are still forwarded byte for byte, so while
+# this provider is active the proxy speaks Anthropic's Messages API (POST /v1/messages)
+# and clients must too - an OpenAI-shaped request will be rejected by Anthropic, not
+# translated here.
+[providers.claude]
+active = false
+api = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key = "${ANTHROPIC_API_KEY}"
 
 # Some providers want extra headers.
 [providers.openrouter]
 active = false
+api = "openai"
 base_url = "https://openrouter.ai/api/v1"
 api_key = "${OPENROUTER_API_KEY}"
 

@@ -29,6 +29,12 @@ const HOP_BY_HOP: [&str; 8] = [
     "upgrade",
 ];
 
+/// Anthropic rejects a request that carries no API version. A client speaking
+/// their protocol always sends one; this is the documented default for anything
+/// that does not.
+const ANTHROPIC_VERSION: HeaderName = HeaderName::from_static("anthropic-version");
+const DEFAULT_ANTHROPIC_VERSION: HeaderValue = HeaderValue::from_static("2023-06-01");
+
 /// Headers we always replace rather than pass through.
 const STRIPPED_REQUEST_HEADERS: [&str; 5] = [
     "host",
@@ -95,12 +101,17 @@ pub async fn proxy(State(state): State<AppState>, request: Request) -> Response 
     }
 
     let mut upstream = state.http.request(parts.method.clone(), &url);
+    let mut client_set_version = false;
     for (name, value) in parts.headers.iter() {
         if !is_stripped_request_header(name) {
+            client_set_version |= name == ANTHROPIC_VERSION;
             upstream = upstream.header(name, value);
         }
     }
     upstream = apply_provider_auth(upstream, provider);
+    if needs_anthropic_version(provider, client_set_version) {
+        upstream = upstream.header(ANTHROPIC_VERSION, DEFAULT_ANTHROPIC_VERSION);
+    }
     let upstream = upstream.body(body_bytes);
 
     let response = match upstream.send().await {
@@ -242,12 +253,24 @@ pub fn apply_provider_auth(
     provider: &Provider,
 ) -> reqwest::RequestBuilder {
     if let Some(key) = provider.api_key() {
-        request = request.bearer_auth(key);
+        // Anthropic authenticates with its own header, not a bearer token.
+        request = if provider.is_anthropic() {
+            request.header("x-api-key", key)
+        } else {
+            request.bearer_auth(key)
+        };
     }
     for (name, value) in &provider.headers {
         request = request.header(name, value);
     }
     request
+}
+
+/// Whether the proxy should supply Anthropic's version header itself. Only when
+/// nobody else did: a second copy of the header is an upstream 400, and a client
+/// that pins a version must keep its own.
+fn needs_anthropic_version(provider: &Provider, client_set_it: bool) -> bool {
+    provider.is_anthropic() && !client_set_it && !provider.sets_anthropic_version()
 }
 
 /// `None` when the caller may proceed, otherwise the 401 to send back.
@@ -298,4 +321,79 @@ fn error_response(status: StatusCode, kind: &str, message: impl Into<String>) ->
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(toml_text: &str) -> Provider {
+        toml::from_str(toml_text).expect("parse provider")
+    }
+
+    fn headers_of(provider: &Provider) -> HeaderMap {
+        let request = apply_provider_auth(
+            reqwest::Client::new().get("https://example.invalid/v1/messages"),
+            provider,
+        );
+        request.build().expect("build request").headers().clone()
+    }
+
+    #[test]
+    fn an_openai_provider_authenticates_with_a_bearer_token() {
+        let headers = headers_of(&provider(
+            r#"
+api = "openai"
+base_url = "https://api.deepseek.com/v1"
+api_key = "sk-test"
+"#,
+        ));
+        assert_eq!(headers[header::AUTHORIZATION], "Bearer sk-test");
+        assert!(!headers.contains_key("x-api-key"));
+    }
+
+    #[test]
+    fn an_anthropic_provider_authenticates_with_x_api_key() {
+        let headers = headers_of(&provider(
+            r#"
+api = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+api_key = "sk-ant-test"
+"#,
+        ));
+        assert_eq!(headers["x-api-key"], "sk-ant-test");
+        assert!(!headers.contains_key(header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn the_version_header_is_supplied_only_when_nobody_else_did() {
+        let anthropic = provider(
+            r#"
+api = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+"#,
+        );
+        assert!(needs_anthropic_version(&anthropic, false));
+        // A client pinning its own version keeps it.
+        assert!(!needs_anthropic_version(&anthropic, true));
+
+        let pinned = provider(
+            r#"
+api = "anthropic"
+base_url = "https://api.anthropic.com/v1"
+
+[headers]
+"anthropic-version" = "2023-01-01"
+"#,
+        );
+        assert!(!needs_anthropic_version(&pinned, false));
+
+        let openai = provider(
+            r#"
+api = "openai"
+base_url = "https://api.deepseek.com/v1"
+"#,
+        );
+        assert!(!needs_anthropic_version(&openai, false));
+    }
 }
