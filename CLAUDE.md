@@ -120,18 +120,32 @@ error. Anything that fails — unknown provider, refused key, unexpected body �
 so the flag is scriptable. Requests go out through `proxy::apply_provider_auth`, the same
 helper the forwarding path uses, so a provider's extra headers apply here too.
 
+**`src/transcript.rs` — the daily request log.** Every forwarded request and its response
+is appended to `<server.log_dir>/llm-proxy-YYYY-MM-DD.log` (local date the request started,
+so a new file begins at midnight; `log_dir` is relative to the config file, `""` turns it
+off). `proxy()` builds a `transcript::Entry` holding the request `Bytes`; `LoggedStream`
+appends each chunk to it and hands it over when the stream completes, fails, or is dropped
+by a hung-up client - an upstream transport failure is recorded too. Entries go over a
+channel to one writer thread, so the forwarding path never touches the disk and concurrent
+entries never interleave. Formatting is for people: JSON is pretty-printed (with
+`serde_json`'s `preserve_order`, so `model` stays first) and a streamed SSE response is
+reassembled into reasoning / text / tool-call / usage sections for both OpenAI chunks and
+Anthropic events, falling back to the raw body when nothing is recognised. This is the only
+place outside `balance.rs` that understands response bodies, and it only ever reads them.
+Request headers are never written, so keys stay out of the files.
+
 **`src/main.rs`** loads `.env` *before* initializing logging — so `LLM_PROXY_LOG` can be set
 there too — then wires the CLI, passes `--provider` into `Config::load` (logging which
 provider won and why: `ACTIVE (default)` vs `ACTIVE (--provider)`), builds the shared
 `reqwest::Client` (its `timeout` covers a whole streamed response, hence the 600s default),
-and constructs `AppState { config, http }`.
+starts the transcript writer, and constructs `AppState { config, http, transcript }`.
 
 ## Testing
 
 Unit tests live in `#[cfg(test)] mod tests` at the bottom of `src/config.rs`,
-`src/proxy.rs`, and `src/balance.rs`, and cover routing precedence, URL joining, client
-auth, the per-protocol auth headers, and balance endpoint/response handling. The proxy
-tests build a `reqwest` request and inspect its headers, so they need no server. The balance
+`src/proxy.rs`, `src/balance.rs`, and `src/transcript.rs`, and cover routing precedence,
+URL joining, client auth, the per-protocol auth headers, balance endpoint/response
+handling, and SSE reassembly for the transcript. The proxy tests build a `reqwest` request and inspect its headers, so they need no server. The balance
 tests parse captured sample payloads and never touch the network — a new provider added to
 `known_for` should come with its documented payload as a test. There is no integration-test
 harness; to verify forwarding and streaming end to end, run a throwaway HTTP server that

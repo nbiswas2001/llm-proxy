@@ -32,6 +32,10 @@ pub struct ServerConfig {
     /// Max request body accepted from a client, in megabytes.
     #[serde(default = "default_body_limit")]
     pub max_body_mb: usize,
+    /// Folder that receives one transcript file per day of every request and
+    /// its response. Relative paths sit beside the config file; "" turns it off.
+    #[serde(default = "default_log_dir")]
+    pub log_dir: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,6 +100,9 @@ fn default_connect_timeout() -> u64 {
 fn default_body_limit() -> usize {
     64
 }
+fn default_log_dir() -> String {
+    "logs".to_string()
+}
 
 impl Default for ServerConfig {
     fn default() -> Self {
@@ -106,6 +113,7 @@ impl Default for ServerConfig {
             request_timeout_secs: default_request_timeout(),
             connect_timeout_secs: default_connect_timeout(),
             max_body_mb: default_body_limit(),
+            log_dir: default_log_dir(),
         }
     }
 }

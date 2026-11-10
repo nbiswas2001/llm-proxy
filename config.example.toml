@@ -12,6 +12,9 @@ port = 8600
 request_timeout_secs = 600 # whole upstream request, including a long stream
 connect_timeout_secs = 15
 max_body_mb = 64
+# Every request and its response is appended to <log_dir>/llm-proxy-YYYY-MM-DD.log,
+# a new file each day. Relative to this file; "" turns the transcript off.
+log_dir = "logs"
 # Keys clients must send as `Authorization: Bearer <key>`.
 # Leave empty (or omit) to accept any client - fine for 127.0.0.1 only.
 api_keys = []

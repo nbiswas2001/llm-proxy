@@ -16,6 +16,7 @@ use tracing::{Level, debug, enabled, trace, warn};
 
 use crate::AppState;
 use crate::config::{Config, Provider};
+use crate::transcript::{self, Outcome};
 
 /// Headers that belong to a single hop and must not be forwarded.
 const HOP_BY_HOP: [&str; 8] = [
@@ -52,6 +53,7 @@ pub async fn health() -> impl IntoResponse {
 /// and streams the upstream response straight back to the client.
 pub async fn proxy(State(state): State<AppState>, request: Request) -> Response {
     let started = Instant::now();
+    let started_at = chrono::Local::now();
     let (parts, body) = request.into_parts();
 
     if let Some(response) = client_auth_error(&state.config, &parts.headers) {
@@ -112,12 +114,32 @@ pub async fn proxy(State(state): State<AppState>, request: Request) -> Response 
     if needs_anthropic_version(provider, client_set_version) {
         upstream = upstream.header(ANTHROPIC_VERSION, DEFAULT_ANTHROPIC_VERSION);
     }
+    // Bytes clones share the buffer, so keeping the request for the transcript is free.
+    let mut record = state.transcript.is_enabled().then(|| transcript::Entry {
+        started: started_at,
+        elapsed: Default::default(),
+        provider: provider_name.to_owned(),
+        label: label.clone(),
+        model: requested_model.clone(),
+        streaming,
+        status: None,
+        outcome: Outcome::Complete,
+        error: None,
+        request: body_bytes.clone(),
+        response: Vec::new(),
+    });
     let upstream = upstream.body(body_bytes);
 
     let response = match upstream.send().await {
         Ok(response) => response,
         Err(err) => {
             warn!(provider = provider_name, %url, error = %err, "upstream request failed");
+            if let Some(mut entry) = record.take() {
+                entry.elapsed = started.elapsed();
+                entry.outcome = Outcome::Failed;
+                entry.error = Some(err.to_string());
+                state.transcript.record(entry);
+            }
             let status = if err.is_timeout() {
                 StatusCode::GATEWAY_TIMEOUT
             } else {
@@ -155,6 +177,9 @@ pub async fn proxy(State(state): State<AppState>, request: Request) -> Response 
         millis(started.elapsed())
     );
 
+    if let Some(entry) = &mut record {
+        entry.status = Some(status.as_u16());
+    }
     let body = LoggedStream {
         inner: Box::pin(response.bytes_stream()),
         label,
@@ -162,12 +187,15 @@ pub async fn proxy(State(state): State<AppState>, request: Request) -> Response 
         bytes: 0,
         chunks: 0,
         ended: false,
+        transcript: state.transcript.clone(),
+        record,
     };
     (status, headers, Body::from_stream(body)).into_response()
 }
 
 /// Wraps the upstream body so the size and duration of a response - a long
-/// stream especially - show up on screen once it finishes.
+/// stream especially - show up on screen once it finishes. It also collects the
+/// body for the transcript, which is written once the stream ends either way.
 struct LoggedStream {
     inner: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>>,
     label: String,
@@ -175,6 +203,20 @@ struct LoggedStream {
     bytes: u64,
     chunks: u64,
     ended: bool,
+    transcript: transcript::Transcript,
+    /// `None` when the transcript is off, and once it has been written.
+    record: Option<transcript::Entry>,
+}
+
+impl LoggedStream {
+    fn finish_record(&mut self, outcome: Outcome, error: Option<String>) {
+        if let Some(mut entry) = self.record.take() {
+            entry.elapsed = self.started.elapsed();
+            entry.outcome = outcome;
+            entry.error = error;
+            self.transcript.record(entry);
+        }
+    }
 }
 
 impl Stream for LoggedStream {
@@ -186,6 +228,9 @@ impl Stream for LoggedStream {
             Poll::Ready(Some(Ok(chunk))) => {
                 this.bytes += chunk.len() as u64;
                 this.chunks += 1;
+                if let Some(entry) = &mut this.record {
+                    entry.response.extend_from_slice(&chunk);
+                }
                 if enabled!(Level::TRACE) {
                     trace!(
                         "   chunk {} ({} B): {}",
@@ -199,6 +244,7 @@ impl Stream for LoggedStream {
             Poll::Ready(Some(Err(err))) => {
                 this.ended = true;
                 warn!("   {} failed mid-body: {err}", this.label);
+                this.finish_record(Outcome::Failed, Some(err.to_string()));
                 Poll::Ready(Some(Err(err)))
             }
             Poll::Ready(None) => {
@@ -210,6 +256,7 @@ impl Stream for LoggedStream {
                     this.chunks,
                     millis(this.started.elapsed())
                 );
+                this.finish_record(Outcome::Complete, None);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -228,6 +275,7 @@ impl Drop for LoggedStream {
                 self.chunks,
                 millis(self.started.elapsed())
             );
+            self.finish_record(Outcome::Aborted, None);
         }
     }
 }

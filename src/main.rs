@@ -1,6 +1,7 @@
 mod balance;
 mod config;
 mod proxy;
+mod transcript;
 
 use std::{
     net::SocketAddr,
@@ -17,6 +18,7 @@ use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 
 use crate::config::Config;
+use crate::transcript::Transcript;
 
 /// OpenAI-compatible proxy in front of an online LLM API.
 #[derive(Parser, Debug)]
@@ -56,6 +58,7 @@ struct Cli {
 pub struct AppState {
     pub config: Arc<Config>,
     pub http: reqwest::Client,
+    pub transcript: Transcript,
 }
 
 #[tokio::main]
@@ -149,9 +152,25 @@ async fn main() -> Result<()> {
         })?;
     let authenticated = !config.server.api_keys.is_empty();
 
+    let transcript = if config.server.log_dir.is_empty() {
+        info!("transcript off (log_dir is empty)");
+        Transcript::disabled()
+    } else {
+        // Like .env, a relative log folder sits beside the config file.
+        let dir = cli
+            .config
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(&config.server.log_dir);
+        info!("writing requests and responses to {}", dir.display());
+        Transcript::start(dir.clone())
+            .with_context(|| format!("creating log folder {}", dir.display()))?
+    };
+
     let state = AppState {
         config: Arc::new(config),
         http,
+        transcript,
     };
 
     let app = Router::new()
